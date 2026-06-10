@@ -84,7 +84,7 @@ impl Map {
     /// of keys. If during iteration we encounter a gap in the data (e.g. the
     /// proof did not include all nodes within the range), the iterator will
     /// yield an error.
-    pub fn range<'a>(&self, bounds: impl RangeBounds<&'a [u8]>) -> Range {
+    pub fn range<'a>(&self, bounds: impl RangeBounds<&'a [u8]>) -> Range<'_> {
         let start_bound = bound_to_inner(bounds.start_bound());
         let end_bound = bound_to_inner(bounds.end_bound());
         let outer_bounds = (
@@ -361,7 +361,7 @@ mod tests {
     #[test]
     fn mapbuilder_insert_including_edge() {
         let mut builder = MapBuilder::new();
-        builder.insert(&Node::Hash([0; HASH_LENGTH])).unwrap();
+        builder.insert(&Node::NodeHash([0; HASH_LENGTH])).unwrap();
         builder.insert(&Node::KV(vec![1, 2, 4], vec![])).unwrap();
 
         assert!(builder.0.right_edge);
@@ -371,7 +371,7 @@ mod tests {
     fn mapbuilder_insert_abridged_edge() {
         let mut builder = MapBuilder::new();
         builder.insert(&Node::KV(vec![1, 2, 3], vec![])).unwrap();
-        builder.insert(&Node::Hash([0; HASH_LENGTH])).unwrap();
+        builder.insert(&Node::NodeHash([0; HASH_LENGTH])).unwrap();
 
         assert!(!builder.0.right_edge);
     }
@@ -380,7 +380,7 @@ mod tests {
     fn mapbuilder_build() {
         let mut builder = MapBuilder::new();
         builder.insert(&Node::KV(vec![1, 2, 3], vec![1])).unwrap();
-        builder.insert(&Node::Hash([0; HASH_LENGTH])).unwrap();
+        builder.insert(&Node::NodeHash([0; HASH_LENGTH])).unwrap();
         builder.insert(&Node::KV(vec![1, 2, 4], vec![2])).unwrap();
 
         let map = builder.build();
@@ -395,7 +395,7 @@ mod tests {
     fn map_get_included() {
         let mut builder = MapBuilder::new();
         builder.insert(&Node::KV(vec![1, 2, 3], vec![1])).unwrap();
-        builder.insert(&Node::Hash([0; HASH_LENGTH])).unwrap();
+        builder.insert(&Node::NodeHash([0; HASH_LENGTH])).unwrap();
         builder.insert(&Node::KV(vec![1, 2, 4], vec![2])).unwrap();
 
         let map = builder.build();
@@ -408,7 +408,7 @@ mod tests {
     fn map_get_missing_absence_proof() {
         let mut builder = MapBuilder::new();
         builder.insert(&Node::KV(vec![1, 2, 3], vec![1])).unwrap();
-        builder.insert(&Node::Hash([0; HASH_LENGTH])).unwrap();
+        builder.insert(&Node::NodeHash([0; HASH_LENGTH])).unwrap();
         builder.insert(&Node::KV(vec![1, 2, 4], vec![2])).unwrap();
 
         let map = builder.build();
@@ -430,7 +430,7 @@ mod tests {
     fn range_abridged() {
         let mut builder = MapBuilder::new();
         builder.insert(&Node::KV(vec![1, 2, 3], vec![1])).unwrap();
-        builder.insert(&Node::Hash([0; HASH_LENGTH])).unwrap();
+        builder.insert(&Node::NodeHash([0; HASH_LENGTH])).unwrap();
         builder.insert(&Node::KV(vec![1, 2, 4], vec![2])).unwrap();
 
         let map = builder.build();
@@ -468,7 +468,7 @@ mod tests {
     fn range_lower_unbounded_map_non_contiguous() {
         let mut builder = MapBuilder::new();
         builder.insert(&Node::KV(vec![1, 2, 3], vec![1])).unwrap();
-        builder.insert(&Node::Hash([1; HASH_LENGTH])).unwrap();
+        builder.insert(&Node::NodeHash([1; HASH_LENGTH])).unwrap();
         builder.insert(&Node::KV(vec![1, 2, 4], vec![1])).unwrap();
 
         let map = builder.build();
@@ -509,7 +509,7 @@ mod tests {
     fn range_abridged_rev() {
         let mut builder = MapBuilder::new();
         builder.insert(&Node::KV(vec![1, 2, 3], vec![1])).unwrap();
-        builder.insert(&Node::Hash([0; HASH_LENGTH])).unwrap();
+        builder.insert(&Node::NodeHash([0; HASH_LENGTH])).unwrap();
         builder.insert(&Node::KV(vec![1, 2, 4], vec![2])).unwrap();
 
         let map = builder.build();
@@ -538,7 +538,7 @@ mod tests {
     fn range_upper_unbounded_map_non_contiguous() {
         let mut builder = MapBuilder::new();
         builder.insert(&Node::KV(vec![1, 2, 3], vec![1])).unwrap();
-        builder.insert(&Node::Hash([1; HASH_LENGTH])).unwrap();
+        builder.insert(&Node::NodeHash([1; HASH_LENGTH])).unwrap();
         builder.insert(&Node::KV(vec![1, 2, 4], vec![1])).unwrap();
 
         let map = builder.build();
@@ -580,16 +580,16 @@ mod tests {
         builder.insert(&Node::KV(vec![1], vec![1])).unwrap();
         builder.insert(&Node::KV(vec![2], vec![1])).unwrap();
         builder.insert(&Node::KV(vec![3], vec![1])).unwrap();
-        builder.insert(&Node::Hash([0; HASH_LENGTH])).unwrap();
+        builder.insert(&Node::NodeHash([0; HASH_LENGTH])).unwrap();
         builder.insert(&Node::KV(vec![5], vec![1])).unwrap();
         let a = builder.build();
 
         let mut builder = MapBuilder::new();
         builder.insert(&Node::KV(vec![1], vec![1])).unwrap();
-        builder.insert(&Node::Hash([0; HASH_LENGTH])).unwrap();
+        builder.insert(&Node::NodeHash([0; HASH_LENGTH])).unwrap();
         builder.insert(&Node::KV(vec![3], vec![1])).unwrap();
         builder.insert(&Node::KV(vec![4], vec![1])).unwrap();
-        builder.insert(&Node::Hash([0; HASH_LENGTH])).unwrap();
+        builder.insert(&Node::NodeHash([0; HASH_LENGTH])).unwrap();
         let b = builder.build();
 
         let joined = a.join(b);

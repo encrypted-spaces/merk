@@ -1,12 +1,14 @@
 mod map;
 
-#[cfg(feature = "full")]
 use {super::Op, std::collections::LinkedList};
 
-use super::tree::execute;
+use super::proof_tree::execute;
 use super::{Decoder, Node};
+use crate::child::Child;
 use crate::error::{Error, Result};
-use crate::tree::{Fetch, Hash, Link, RefWalker};
+use crate::hash::Hash;
+use crate::node::Node as TreeNode;
+use crate::walker::RefWalker;
 use std::cmp::{max, min, Ordering};
 use std::collections::BTreeSet;
 use std::ops::RangeInclusive;
@@ -24,14 +26,6 @@ impl Query {
     /// Creates a new query which contains no items.
     pub fn new() -> Self {
         Default::default()
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.items.len()
-    }
-
-    pub(crate) fn iter(&self) -> impl Iterator<Item = &QueryItem> {
-        self.items.iter()
     }
 
     /// Adds an individual key to the query, so that its value (or its absence)
@@ -134,7 +128,7 @@ impl QueryItem {
 
     pub fn contains(&self, key: &[u8]) -> bool {
         let (bound, inclusive) = self.upper_bound();
-        return key >= self.lower_bound() && (key < bound || (key == bound && inclusive));
+        key >= self.lower_bound() && (key < bound || (key == bound && inclusive))
     }
 
     fn merge(self, other: QueryItem) -> QueryItem {
@@ -208,27 +202,15 @@ impl From<Vec<u8>> for QueryItem {
     }
 }
 
-impl Link {
-    /// Creates a `Node::Hash` from this link. Panics if the link is of variant
-    /// `Link::Modified` since its hash has not yet been computed.
-    #[cfg(feature = "full")]
+impl Child {
+    /// Creates a `Node::NodeHash` from this child. Panics if the child's hash has
+    /// not yet been computed (modified resident child).
     fn to_hash_node(&self) -> Node {
-        let hash = match self {
-            Link::Reference { hash, .. } => hash,
-            Link::Modified { .. } => {
-                panic!("Cannot convert Link::Modified to proof hash node");
-            }
-            Link::Uncommitted { hash, .. } => hash,
-            Link::Loaded { hash, .. } => hash,
-        };
-        Node::Hash(*hash)
+        Node::NodeHash(*self.hash())
     }
 }
 
-impl<'a, S> RefWalker<'a, S>
-where
-    S: Fetch + Sized + Send + Clone,
-{
+impl<'a> RefWalker<'a> {
     /// Creates a `Node::KV` from the key/value pair of the root node.
     pub(crate) fn to_kv_node(&self) -> Node {
         Node::KV(self.tree().key().to_vec(), self.tree().value().to_vec())
@@ -240,21 +222,10 @@ where
         Node::KVHash(*self.tree().kv_hash())
     }
 
-    /// Creates a `Node::Hash` from the hash of the node.
-    pub(crate) fn to_hash_node(&self) -> Node {
-        Node::Hash(self.tree().hash())
-    }
-
-    /// Generates a proof for the list of queried keys. Returns a tuple
-    /// containing the generated proof operators, and a tuple representing if
-    /// any keys were queried were less than the left edge or greater than the
-    /// right edge, respectively.
-    #[cfg(feature = "full")]
     pub(crate) fn create_proof(
-        &mut self,
+        &self,
         query: &[QueryItem],
     ) -> Result<(LinkedList<Op>, (bool, bool))> {
-        // TODO: don't copy into vec, support comparing QI to byte slice
         let node_key = QueryItem::Key(self.tree().key().to_vec());
         let search = query.binary_search_by(|key| key.cmp(&node_key));
 
@@ -264,16 +235,12 @@ where
                 let left_bound = item.lower_bound();
                 let right_bound = item.upper_bound().0;
 
-                // if range starts before this node's key, include it in left
-                // child's query
                 let left_query = if left_bound < self.tree().key() {
                     &query[..=index]
                 } else {
                     &query[..index]
                 };
 
-                // if range ends after this node's key, include it in right
-                // child's query
                 let right_query = if right_bound > self.tree().key() {
                     &query[index..]
                 } else {
@@ -313,23 +280,20 @@ where
         Ok((proof, (left_absence.0, right_absence.1)))
     }
 
-    /// Similar to `create_proof`. Recurses into the child on the given side and
-    /// generates a proof for the queried keys.
-    #[cfg(feature = "full")]
     fn create_child_proof(
-        &mut self,
+        &self,
         left: bool,
         query: &[QueryItem],
     ) -> Result<(LinkedList<Op>, (bool, bool))> {
         Ok(if !query.is_empty() {
-            if let Some(mut child) = self.walk(left)? {
+            if let Some(child) = self.walk(left) {
                 child.create_proof(query)?
             } else {
                 (LinkedList::new(), (true, true))
             }
-        } else if let Some(link) = self.tree().link(left) {
+        } else if let Some(child) = self.tree().child_ref(left) {
             let mut proof = LinkedList::new();
-            proof.push_back(Op::Push(link.to_hash_node()));
+            proof.push_back(Op::Push(child.to_hash_node()));
             (proof, (false, false))
         } else {
             (LinkedList::new(), (false, false))
@@ -337,6 +301,11 @@ where
     }
 }
 
+/// Verifies the encoded proof against the expected root hash.
+///
+/// Returns a verified partial view of the proof contents. Callers can query the
+/// returned `Map` with `get` or `range`; those accessors return `Err` if the
+/// proof does not contain enough data to prove the requested key or range.
 pub fn verify(bytes: &[u8], expected_hash: Hash) -> Result<Map> {
     let ops = Decoder::new(bytes);
     let mut map_builder = MapBuilder::new();
@@ -350,25 +319,20 @@ pub fn verify(bytes: &[u8], expected_hash: Hash) -> Result<Map> {
     Ok(map_builder.build())
 }
 
-/// Verifies the encoded proof with the given query and expected hash.
+/// Verifies the encoded proof with the given query and expected root hash.
 ///
-/// Every key in `keys` is checked to either have a key/value pair in the proof,
-/// or to have its absence in the tree proven.
-///
-/// Returns `Err` if the proof is invalid, or a list of proven values associated
-/// with `keys`. For example, if `keys` contains keys `A` and `B`, the returned
-/// list will contain 2 elements, the value of `A` and the value of `B`. Keys
-/// proven to be absent in the tree will have an entry of `None`, keys that have
-/// a proven value will have an entry of `Some(value)`.
-#[deprecated]
+/// Every requested key or range is checked against the proof. Missing keys that
+/// are proven absent are omitted from the returned values. If the proof does
+/// not contain enough data to prove a requested key or range, `Err` is
+/// returned.
 pub fn verify_query(
     bytes: &[u8],
     query: &Query,
     expected_hash: Hash,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let mut output = Vec::with_capacity(query.len());
+    let mut output = Vec::with_capacity(query.items.len());
     let mut last_push = None;
-    let mut query = query.iter().peekable();
+    let mut query = query.items.iter().peekable();
     let mut in_range = false;
 
     let ops = Decoder::new(bytes);
@@ -376,31 +340,17 @@ pub fn verify_query(
     let root = execute(ops, true, |node| {
         if let Node::KV(key, value) = node {
             while let Some(item) = query.peek() {
-                // get next item in query
                 let query_item = *item;
-                // we have not reached next queried part of tree
+
                 if *query_item > key.as_slice() {
-                    // continue to next push
                     break;
                 }
 
                 if !in_range {
-                    // this is the first data we have encountered for this query
-                    // item. ensure lower bound of query item is proven
                     match last_push {
-                        // lower bound is proven - we have an exact match
                         _ if key == query_item.lower_bound() => {}
-
-                        // lower bound is proven - this is the leftmost node
-                        // in the tree
                         None => {}
-
-                        // lower bound is proven - the preceding tree node
-                        // is lower than the bound
                         Some(Node::KV(_, _)) => {}
-
-                        // cannot verify lower bound - we have an abridged
-                        // tree so we cannot tell what the preceding key was
                         Some(_) => {
                             return Err(Error::Bound(
                                 "Cannot verify lower bound of queried range".into(),
@@ -410,32 +360,18 @@ pub fn verify_query(
                 }
 
                 if key.as_slice() >= query_item.upper_bound().0 {
-                    // at or past upper bound of range (or this was an exact
-                    // match on a single-key queryitem), advance to next query
-                    // item
                     query.next();
                     in_range = false;
                 } else {
-                    // have not reached upper bound, we expect more values
-                    // to be proven in the range (and all pushes should be
-                    // unabridged until we reach end of range)
                     in_range = true;
                 }
 
-                // this push matches the queried item
                 if query_item.contains(key) {
-                    // add data to output
                     output.push((key.clone(), value.clone()));
-
-                    // continue to next push
                     break;
                 }
-
-                // continue to next queried item
             }
         } else if in_range {
-            // we encountered a queried range but the proof was abridged (saw a
-            // non-KV push), we are missing some part of the range
             return Err(Error::MissingData);
         }
 
@@ -444,15 +380,9 @@ pub fn verify_query(
         Ok(())
     })?;
 
-    // we have remaining query items, check absence proof against right edge of
-    // tree
     if query.peek().is_some() {
         match last_push {
-            // last node in tree was less than queried item
             Some(Node::KV(_, _)) => {}
-
-            // proof contains abridged data so we cannot verify absence of
-            // remaining query items
             _ => {
                 return Err(Error::MissingData);
             }
@@ -466,27 +396,98 @@ pub fn verify_query(
     Ok(output)
 }
 
-#[allow(deprecated)]
+pub fn prove_resident<Q, I>(maybe_tree: Option<&TreeNode>, query: I) -> Result<Vec<u8>>
+where
+    Q: Into<QueryItem>,
+    I: IntoIterator<Item = Q>,
+{
+    let query_vec: Vec<QueryItem> = query.into_iter().map(Into::into).collect();
+    let tree =
+        maybe_tree.ok_or_else(|| Error::Proof("Cannot create proof for empty tree".into()))?;
+    let walker = RefWalker::new(tree);
+    let (proof, _) = walker.create_proof(query_vec.as_slice())?;
+    let mut bytes = Vec::with_capacity(128);
+    super::encode_into(proof.iter(), &mut bytes);
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod test {
     use super::super::encoding::encode_into;
     use super::super::*;
     use super::*;
+    use crate::node::Node as TreeNode;
     use crate::test_utils::make_tree_seq;
-    use crate::tree::{NoopCommit, PanicSource, RefWalker, Tree};
+    use crate::walker::RefWalker;
     use ed::Encode;
 
-    fn make_3_node_tree() -> Result<Tree> {
-        let mut tree = Tree::new(vec![5], vec![5])?
-            .attach(true, Some(Tree::new(vec![3], vec![3])?))
-            .attach(false, Some(Tree::new(vec![7], vec![7])?));
-        tree.commit(&mut NoopCommit {}).expect("commit failed");
+    fn make_3_node_tree() -> Result<TreeNode> {
+        let mut tree = TreeNode::new(vec![5], vec![5])?
+            .attach(true, Some(TreeNode::new(vec![3], vec![3])?))
+            .attach(false, Some(TreeNode::new(vec![7], vec![7])?));
+        tree.commit();
         Ok(tree)
     }
 
+    fn assert_verified_values(
+        bytes: &[u8],
+        expected_hash: Hash,
+        expected: &[(Vec<u8>, Option<Vec<u8>>)],
+    ) -> Result<()> {
+        let mut query = Query::new();
+        for (key, _) in expected {
+            query.insert_key(key.clone());
+        }
+
+        let result = verify_query(bytes, &query, expected_hash)?;
+        let mut values = std::collections::HashMap::new();
+        for (key, value) in result {
+            assert!(values.insert(key, value).is_none());
+        }
+
+        for (key, expected_value) in expected {
+            assert_eq!(values.get(key), expected_value.as_ref());
+        }
+        Ok(())
+    }
+
+    fn encode_query_proof(tree: &TreeNode, queryitems: &[QueryItem]) -> Vec<u8> {
+        let walker = RefWalker::new(tree);
+        let (proof, _) = walker
+            .create_proof(queryitems)
+            .expect("create_proof errored");
+        let mut bytes = vec![];
+        encode_into(proof.iter(), &mut bytes);
+        bytes
+    }
+
+    fn query_from_items(queryitems: &[QueryItem]) -> Query {
+        let mut query = Query::new();
+        for item in queryitems {
+            query.insert_item(item.clone());
+        }
+        query
+    }
+
+    fn assert_verified_query_values(
+        bytes: &[u8],
+        expected_hash: Hash,
+        queryitems: &[QueryItem],
+        expected: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<()> {
+        let query = query_from_items(queryitems);
+        let result = verify_query(bytes, &query, expected_hash)?;
+        assert_eq!(result, expected);
+        Ok(())
+    }
+
+    fn seq_key(key: u64) -> Vec<u8> {
+        key.to_be_bytes().to_vec()
+    }
+
     fn verify_keys_test(keys: Vec<Vec<u8>>, expected_result: Vec<Option<Vec<u8>>>) -> Result<()> {
-        let mut tree = make_3_node_tree()?;
-        let mut walker = RefWalker::new(&mut tree, PanicSource {});
+        let tree = make_3_node_tree()?;
+        let walker = RefWalker::new(&tree);
 
         let (proof, _) = walker
             .create_proof(
@@ -501,25 +502,65 @@ mod test {
         encode_into(proof.iter(), &mut bytes);
 
         let expected_hash = [
-            185, 181, 28, 21, 108, 13, 202, 48, 129, 184, 3, 8, 157, 78, 213, 241, 94, 200, 205,
-            95, 179, 177, 195, 177, 216, 233, 164, 73, 102, 32, 141, 37,
+            26, 197, 74, 4, 89, 161, 76, 41, 37, 166, 197, 214, 68, 53, 6, 228, 91, 221, 131, 222,
+            175, 210, 106, 172, 78, 117, 48, 59, 209, 195, 53, 80,
         ];
 
-        let mut query = Query::new();
-        for key in keys.iter() {
-            query.insert_key(key.clone());
-        }
+        let expected: Vec<_> = keys.into_iter().zip(expected_result).collect();
+        assert_verified_values(bytes.as_slice(), expected_hash, &expected)
+    }
 
-        let result = verify_query(bytes.as_slice(), &query, expected_hash).expect("verify failed");
+    #[test]
+    fn verify_query_keys() -> Result<()> {
+        let tree = make_3_node_tree()?;
+        let queryitems = vec![QueryItem::Key(vec![3]), QueryItem::Key(vec![7])];
+        let bytes = encode_query_proof(&tree, queryitems.as_slice());
+        let query = query_from_items(queryitems.as_slice());
 
-        let mut values = std::collections::HashMap::new();
-        for (key, value) in result {
-            assert!(values.insert(key, value).is_none());
-        }
+        let result = verify_query(bytes.as_slice(), &query, tree.hash())?;
 
-        for (key, expected_value) in keys.iter().zip(expected_result.iter()) {
-            assert_eq!(values.get(key), expected_value.as_ref());
-        }
+        assert_eq!(result, vec![(vec![3], vec![3]), (vec![7], vec![7])]);
+        Ok(())
+    }
+
+    #[test]
+    fn verify_query_proven_absence_returns_no_value() -> Result<()> {
+        let tree = make_3_node_tree()?;
+        let queryitems = vec![QueryItem::Key(vec![6])];
+        let bytes = encode_query_proof(&tree, queryitems.as_slice());
+        let query = query_from_items(queryitems.as_slice());
+
+        let result = verify_query(bytes.as_slice(), &query, tree.hash())?;
+
+        assert!(result.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn verify_query_range() -> Result<()> {
+        let tree = make_tree_seq(10);
+        let queryitems = vec![QueryItem::Range(seq_key(5)..seq_key(7))];
+        let bytes = encode_query_proof(&tree, queryitems.as_slice());
+        let query = query_from_items(queryitems.as_slice());
+
+        let result = verify_query(bytes.as_slice(), &query, tree.hash())?;
+
+        assert_eq!(
+            result,
+            vec![(seq_key(5), vec![123; 60]), (seq_key(6), vec![123; 60])]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn verify_query_errors_when_proof_does_not_cover_query() -> Result<()> {
+        let tree = make_3_node_tree()?;
+        let bytes = encode_query_proof(&tree, &[QueryItem::Key(vec![5])]);
+        let query = query_from_items(&[QueryItem::Key(vec![7])]);
+
+        let result = verify_query(bytes.as_slice(), &query, tree.hash());
+
+        assert!(matches!(result, Err(Error::MissingData)));
         Ok(())
     }
 
@@ -573,8 +614,8 @@ mod test {
 
     #[test]
     fn empty_proof() -> Result<()> {
-        let mut tree = make_3_node_tree()?;
-        let mut walker = RefWalker::new(&mut tree, PanicSource {});
+        let tree = make_3_node_tree()?;
+        let walker = RefWalker::new(&tree);
 
         let (proof, absence) = walker
             .create_proof(vec![].as_slice())
@@ -583,24 +624,24 @@ mod test {
         let mut iter = proof.iter();
         assert_eq!(
             iter.next(),
-            Some(&Op::Push(Node::Hash([
-                203, 210, 184, 52, 29, 56, 76, 7, 155, 239, 81, 16, 54, 13, 106, 27, 44, 218, 198,
-                245, 203, 189, 15, 203, 55, 184, 75, 146, 127, 38, 143, 214
+            Some(&Op::Push(Node::NodeHash([
+                58, 114, 115, 81, 9, 53, 210, 78, 220, 23, 100, 136, 26, 152, 18, 112, 219, 217,
+                48, 154, 227, 92, 100, 5, 35, 234, 194, 199, 112, 53, 188, 16
             ])))
         );
         assert_eq!(
             iter.next(),
             Some(&Op::Push(Node::KVHash([
-                169, 4, 73, 65, 62, 49, 160, 159, 37, 166, 195, 249, 63, 31, 23, 11, 169, 0, 24,
-                104, 179, 211, 218, 38, 108, 129, 117, 232, 65, 101, 194, 157
+                233, 192, 89, 232, 161, 148, 62, 69, 165, 24, 156, 25, 44, 34, 166, 17, 115, 252,
+                75, 105, 14, 252, 228, 57, 78, 44, 230, 91, 45, 221, 40, 10
             ])))
         );
         assert_eq!(iter.next(), Some(&Op::Parent));
         assert_eq!(
             iter.next(),
-            Some(&Op::Push(Node::Hash([
-                219, 24, 98, 131, 160, 47, 139, 94, 223, 118, 217, 187, 42, 215, 213, 101, 213,
-                225, 169, 57, 224, 210, 17, 135, 220, 63, 160, 42, 148, 0, 121, 115
+            Some(&Op::Push(Node::NodeHash([
+                164, 34, 118, 190, 242, 9, 177, 28, 85, 32, 6, 231, 131, 61, 119, 22, 48, 13, 117,
+                231, 1, 18, 220, 48, 102, 122, 204, 22, 126, 24, 36, 220
             ])))
         );
         assert_eq!(iter.next(), Some(&Op::Child));
@@ -609,15 +650,14 @@ mod test {
 
         let mut bytes = vec![];
         encode_into(proof.iter(), &mut bytes);
-        let res = verify_query(bytes.as_slice(), &Query::new(), tree.hash()).unwrap();
-        assert!(res.is_empty());
+        verify_query(bytes.as_slice(), &Query::new(), tree.hash()).unwrap();
         Ok(())
     }
 
     #[test]
     fn root_proof() -> Result<()> {
-        let mut tree = make_3_node_tree()?;
-        let mut walker = RefWalker::new(&mut tree, PanicSource {});
+        let tree = make_3_node_tree()?;
+        let walker = RefWalker::new(&tree);
 
         let queryitems = vec![QueryItem::Key(vec![5])];
         let (proof, absence) = walker
@@ -627,18 +667,18 @@ mod test {
         let mut iter = proof.iter();
         assert_eq!(
             iter.next(),
-            Some(&Op::Push(Node::Hash([
-                203, 210, 184, 52, 29, 56, 76, 7, 155, 239, 81, 16, 54, 13, 106, 27, 44, 218, 198,
-                245, 203, 189, 15, 203, 55, 184, 75, 146, 127, 38, 143, 214
+            Some(&Op::Push(Node::NodeHash([
+                58, 114, 115, 81, 9, 53, 210, 78, 220, 23, 100, 136, 26, 152, 18, 112, 219, 217,
+                48, 154, 227, 92, 100, 5, 35, 234, 194, 199, 112, 53, 188, 16
             ])))
         );
         assert_eq!(iter.next(), Some(&Op::Push(Node::KV(vec![5], vec![5]))));
         assert_eq!(iter.next(), Some(&Op::Parent));
         assert_eq!(
             iter.next(),
-            Some(&Op::Push(Node::Hash([
-                219, 24, 98, 131, 160, 47, 139, 94, 223, 118, 217, 187, 42, 215, 213, 101, 213,
-                225, 169, 57, 224, 210, 17, 135, 220, 63, 160, 42, 148, 0, 121, 115
+            Some(&Op::Push(Node::NodeHash([
+                164, 34, 118, 190, 242, 9, 177, 28, 85, 32, 6, 231, 131, 61, 119, 22, 48, 13, 117,
+                231, 1, 18, 220, 48, 102, 122, 204, 22, 126, 24, 36, 220
             ])))
         );
         assert_eq!(iter.next(), Some(&Op::Child));
@@ -647,19 +687,20 @@ mod test {
 
         let mut bytes = vec![];
         encode_into(proof.iter(), &mut bytes);
-        let mut query = Query::new();
-        for item in queryitems {
-            query.insert_item(item);
-        }
-        let res = verify_query(bytes.as_slice(), &query, tree.hash()).unwrap();
-        assert_eq!(res, vec![(vec![5], vec![5])]);
+        assert_verified_query_values(
+            bytes.as_slice(),
+            tree.hash(),
+            queryitems.as_slice(),
+            vec![(vec![5], vec![5])],
+        )?;
+        assert_verified_values(bytes.as_slice(), tree.hash(), &[(vec![5], Some(vec![5]))])?;
         Ok(())
     }
 
     #[test]
     fn leaf_proof() -> Result<()> {
-        let mut tree = make_3_node_tree()?;
-        let mut walker = RefWalker::new(&mut tree, PanicSource {});
+        let tree = make_3_node_tree()?;
+        let walker = RefWalker::new(&tree);
 
         let queryitems = vec![QueryItem::Key(vec![3])];
         let (proof, absence) = walker
@@ -671,16 +712,16 @@ mod test {
         assert_eq!(
             iter.next(),
             Some(&Op::Push(Node::KVHash([
-                169, 4, 73, 65, 62, 49, 160, 159, 37, 166, 195, 249, 63, 31, 23, 11, 169, 0, 24,
-                104, 179, 211, 218, 38, 108, 129, 117, 232, 65, 101, 194, 157
+                233, 192, 89, 232, 161, 148, 62, 69, 165, 24, 156, 25, 44, 34, 166, 17, 115, 252,
+                75, 105, 14, 252, 228, 57, 78, 44, 230, 91, 45, 221, 40, 10
             ])))
         );
         assert_eq!(iter.next(), Some(&Op::Parent));
         assert_eq!(
             iter.next(),
-            Some(&Op::Push(Node::Hash([
-                219, 24, 98, 131, 160, 47, 139, 94, 223, 118, 217, 187, 42, 215, 213, 101, 213,
-                225, 169, 57, 224, 210, 17, 135, 220, 63, 160, 42, 148, 0, 121, 115
+            Some(&Op::Push(Node::NodeHash([
+                164, 34, 118, 190, 242, 9, 177, 28, 85, 32, 6, 231, 131, 61, 119, 22, 48, 13, 117,
+                231, 1, 18, 220, 48, 102, 122, 204, 22, 126, 24, 36, 220
             ])))
         );
         assert_eq!(iter.next(), Some(&Op::Child));
@@ -689,19 +730,20 @@ mod test {
 
         let mut bytes = vec![];
         encode_into(proof.iter(), &mut bytes);
-        let mut query = Query::new();
-        for item in queryitems {
-            query.insert_item(item);
-        }
-        let res = verify_query(bytes.as_slice(), &query, tree.hash()).unwrap();
-        assert_eq!(res, vec![(vec![3], vec![3])]);
+        assert_verified_query_values(
+            bytes.as_slice(),
+            tree.hash(),
+            queryitems.as_slice(),
+            vec![(vec![3], vec![3])],
+        )?;
+        assert_verified_values(bytes.as_slice(), tree.hash(), &[(vec![3], Some(vec![3]))])?;
         Ok(())
     }
 
     #[test]
     fn double_leaf_proof() -> Result<()> {
-        let mut tree = make_3_node_tree()?;
-        let mut walker = RefWalker::new(&mut tree, PanicSource {});
+        let tree = make_3_node_tree()?;
+        let walker = RefWalker::new(&tree);
 
         let queryitems = vec![QueryItem::Key(vec![3]), QueryItem::Key(vec![7])];
         let (proof, absence) = walker
@@ -713,8 +755,8 @@ mod test {
         assert_eq!(
             iter.next(),
             Some(&Op::Push(Node::KVHash([
-                169, 4, 73, 65, 62, 49, 160, 159, 37, 166, 195, 249, 63, 31, 23, 11, 169, 0, 24,
-                104, 179, 211, 218, 38, 108, 129, 117, 232, 65, 101, 194, 157
+                233, 192, 89, 232, 161, 148, 62, 69, 165, 24, 156, 25, 44, 34, 166, 17, 115, 252,
+                75, 105, 14, 252, 228, 57, 78, 44, 230, 91, 45, 221, 40, 10
             ])))
         );
         assert_eq!(iter.next(), Some(&Op::Parent));
@@ -725,19 +767,24 @@ mod test {
 
         let mut bytes = vec![];
         encode_into(proof.iter(), &mut bytes);
-        let mut query = Query::new();
-        for item in queryitems {
-            query.insert_item(item);
-        }
-        let res = verify_query(bytes.as_slice(), &query, tree.hash()).unwrap();
-        assert_eq!(res, vec![(vec![3], vec![3]), (vec![7], vec![7]),]);
+        assert_verified_query_values(
+            bytes.as_slice(),
+            tree.hash(),
+            queryitems.as_slice(),
+            vec![(vec![3], vec![3]), (vec![7], vec![7])],
+        )?;
+        assert_verified_values(
+            bytes.as_slice(),
+            tree.hash(),
+            &[(vec![3], Some(vec![3])), (vec![7], Some(vec![7]))],
+        )?;
         Ok(())
     }
 
     #[test]
     fn all_nodes_proof() -> Result<()> {
-        let mut tree = make_3_node_tree()?;
-        let mut walker = RefWalker::new(&mut tree, PanicSource {});
+        let tree = make_3_node_tree()?;
+        let walker = RefWalker::new(&tree);
 
         let queryitems = vec![
             QueryItem::Key(vec![3]),
@@ -759,22 +806,28 @@ mod test {
 
         let mut bytes = vec![];
         encode_into(proof.iter(), &mut bytes);
-        let mut query = Query::new();
-        for item in queryitems {
-            query.insert_item(item);
-        }
-        let res = verify_query(bytes.as_slice(), &query, tree.hash()).unwrap();
-        assert_eq!(
-            res,
-            vec![(vec![3], vec![3]), (vec![5], vec![5]), (vec![7], vec![7]),]
-        );
+        assert_verified_query_values(
+            bytes.as_slice(),
+            tree.hash(),
+            queryitems.as_slice(),
+            vec![(vec![3], vec![3]), (vec![5], vec![5]), (vec![7], vec![7])],
+        )?;
+        assert_verified_values(
+            bytes.as_slice(),
+            tree.hash(),
+            &[
+                (vec![3], Some(vec![3])),
+                (vec![5], Some(vec![5])),
+                (vec![7], Some(vec![7])),
+            ],
+        )?;
         Ok(())
     }
 
     #[test]
     fn global_edge_absence_proof() -> Result<()> {
-        let mut tree = make_3_node_tree()?;
-        let mut walker = RefWalker::new(&mut tree, PanicSource {});
+        let tree = make_3_node_tree()?;
+        let walker = RefWalker::new(&tree);
 
         let queryitems = vec![QueryItem::Key(vec![8])];
         let (proof, absence) = walker
@@ -784,16 +837,16 @@ mod test {
         let mut iter = proof.iter();
         assert_eq!(
             iter.next(),
-            Some(&Op::Push(Node::Hash([
-                203, 210, 184, 52, 29, 56, 76, 7, 155, 239, 81, 16, 54, 13, 106, 27, 44, 218, 198,
-                245, 203, 189, 15, 203, 55, 184, 75, 146, 127, 38, 143, 214
+            Some(&Op::Push(Node::NodeHash([
+                58, 114, 115, 81, 9, 53, 210, 78, 220, 23, 100, 136, 26, 152, 18, 112, 219, 217,
+                48, 154, 227, 92, 100, 5, 35, 234, 194, 199, 112, 53, 188, 16
             ])))
         );
         assert_eq!(
             iter.next(),
             Some(&Op::Push(Node::KVHash([
-                169, 4, 73, 65, 62, 49, 160, 159, 37, 166, 195, 249, 63, 31, 23, 11, 169, 0, 24,
-                104, 179, 211, 218, 38, 108, 129, 117, 232, 65, 101, 194, 157
+                233, 192, 89, 232, 161, 148, 62, 69, 165, 24, 156, 25, 44, 34, 166, 17, 115, 252,
+                75, 105, 14, 252, 228, 57, 78, 44, 230, 91, 45, 221, 40, 10
             ])))
         );
         assert_eq!(iter.next(), Some(&Op::Parent));
@@ -804,19 +857,15 @@ mod test {
 
         let mut bytes = vec![];
         encode_into(proof.iter(), &mut bytes);
-        let mut query = Query::new();
-        for item in queryitems {
-            query.insert_item(item);
-        }
-        let res = verify_query(bytes.as_slice(), &query, tree.hash()).unwrap();
-        assert_eq!(res, vec![]);
+        assert_verified_query_values(bytes.as_slice(), tree.hash(), queryitems.as_slice(), vec![])?;
+        assert_verified_values(bytes.as_slice(), tree.hash(), &[(vec![8], None)])?;
         Ok(())
     }
 
     #[test]
     fn absence_proof() -> Result<()> {
-        let mut tree = make_3_node_tree()?;
-        let mut walker = RefWalker::new(&mut tree, PanicSource {});
+        let tree = make_3_node_tree()?;
+        let walker = RefWalker::new(&tree);
 
         let queryitems = vec![QueryItem::Key(vec![6])];
         let (proof, absence) = walker
@@ -826,9 +875,9 @@ mod test {
         let mut iter = proof.iter();
         assert_eq!(
             iter.next(),
-            Some(&Op::Push(Node::Hash([
-                203, 210, 184, 52, 29, 56, 76, 7, 155, 239, 81, 16, 54, 13, 106, 27, 44, 218, 198,
-                245, 203, 189, 15, 203, 55, 184, 75, 146, 127, 38, 143, 214
+            Some(&Op::Push(Node::NodeHash([
+                58, 114, 115, 81, 9, 53, 210, 78, 220, 23, 100, 136, 26, 152, 18, 112, 219, 217,
+                48, 154, 227, 92, 100, 5, 35, 234, 194, 199, 112, 53, 188, 16
             ])))
         );
         assert_eq!(iter.next(), Some(&Op::Push(Node::KV(vec![5], vec![5]))));
@@ -840,28 +889,24 @@ mod test {
 
         let mut bytes = vec![];
         encode_into(proof.iter(), &mut bytes);
-        let mut query = Query::new();
-        for item in queryitems {
-            query.insert_item(item);
-        }
-        let res = verify_query(bytes.as_slice(), &query, tree.hash()).unwrap();
-        assert_eq!(res, vec![]);
+        assert_verified_query_values(bytes.as_slice(), tree.hash(), queryitems.as_slice(), vec![])?;
+        assert_verified_values(bytes.as_slice(), tree.hash(), &[(vec![6], None)])?;
         Ok(())
     }
 
     #[test]
     fn doc_proof() -> Result<()> {
-        let mut tree = Tree::new(vec![5], vec![5])?
+        let mut tree = TreeNode::new(vec![5], vec![5])?
             .attach(
                 true,
                 Some(
-                    Tree::new(vec![2], vec![2])?
-                        .attach(true, Some(Tree::new(vec![1], vec![1])?))
+                    TreeNode::new(vec![2], vec![2])?
+                        .attach(true, Some(TreeNode::new(vec![1], vec![1])?))
                         .attach(
                             false,
                             Some(
-                                Tree::new(vec![4], vec![4])?
-                                    .attach(true, Some(Tree::new(vec![3], vec![3])?)),
+                                TreeNode::new(vec![4], vec![4])?
+                                    .attach(true, Some(TreeNode::new(vec![3], vec![3])?)),
                             ),
                         ),
                 ),
@@ -869,27 +914,27 @@ mod test {
             .attach(
                 false,
                 Some(
-                    Tree::new(vec![9], vec![9])?
+                    TreeNode::new(vec![9], vec![9])?
                         .attach(
                             true,
                             Some(
-                                Tree::new(vec![7], vec![7])?
-                                    .attach(true, Some(Tree::new(vec![6], vec![6])?))
-                                    .attach(false, Some(Tree::new(vec![8], vec![8])?)),
+                                TreeNode::new(vec![7], vec![7])?
+                                    .attach(true, Some(TreeNode::new(vec![6], vec![6])?))
+                                    .attach(false, Some(TreeNode::new(vec![8], vec![8])?)),
                             ),
                         )
                         .attach(
                             false,
                             Some(
-                                Tree::new(vec![11], vec![11])?
-                                    .attach(true, Some(Tree::new(vec![10], vec![10])?)),
+                                TreeNode::new(vec![11], vec![11])?
+                                    .attach(true, Some(TreeNode::new(vec![10], vec![10])?)),
                             ),
                         ),
                 ),
             );
-        tree.commit(&mut NoopCommit {}).unwrap();
+        tree.commit();
 
-        let mut walker = RefWalker::new(&mut tree, PanicSource {});
+        let walker = RefWalker::new(&tree);
 
         let queryitems = vec![
             QueryItem::Key(vec![1]),
@@ -912,16 +957,16 @@ mod test {
         assert_eq!(
             iter.next(),
             Some(&Op::Push(Node::KVHash([
-                169, 4, 73, 65, 62, 49, 160, 159, 37, 166, 195, 249, 63, 31, 23, 11, 169, 0, 24,
-                104, 179, 211, 218, 38, 108, 129, 117, 232, 65, 101, 194, 157
+                233, 192, 89, 232, 161, 148, 62, 69, 165, 24, 156, 25, 44, 34, 166, 17, 115, 252,
+                75, 105, 14, 252, 228, 57, 78, 44, 230, 91, 45, 221, 40, 10
             ])))
         );
         assert_eq!(iter.next(), Some(&Op::Parent));
         assert_eq!(
             iter.next(),
-            Some(&Op::Push(Node::Hash([
-                148, 241, 151, 144, 247, 220, 92, 79, 70, 252, 168, 222, 27, 218, 53, 156, 0, 136,
-                161, 107, 83, 78, 150, 246, 51, 230, 164, 248, 17, 30, 147, 91
+            Some(&Op::Push(Node::NodeHash([
+                185, 150, 80, 49, 7, 210, 18, 118, 201, 115, 155, 49, 189, 239, 64, 11, 31, 167,
+                74, 249, 84, 113, 192, 169, 137, 13, 151, 119, 106, 146, 122, 145
             ])))
         );
         assert_eq!(iter.next(), Some(&Op::Child));
@@ -934,29 +979,36 @@ mod test {
             bytes,
             vec![
                 3, 0, 1, 1, 0, 1, 1, 3, 0, 1, 2, 0, 1, 2, 16, 3, 0, 1, 3, 0, 1, 3, 3, 0, 1, 4, 0,
-                1, 4, 16, 17, 2, 169, 4, 73, 65, 62, 49, 160, 159, 37, 166, 195, 249, 63, 31, 23,
-                11, 169, 0, 24, 104, 179, 211, 218, 38, 108, 129, 117, 232, 65, 101, 194, 157, 16,
-                1, 148, 241, 151, 144, 247, 220, 92, 79, 70, 252, 168, 222, 27, 218, 53, 156, 0,
-                136, 161, 107, 83, 78, 150, 246, 51, 230, 164, 248, 17, 30, 147, 91, 17
+                1, 4, 16, 17, 2, 233, 192, 89, 232, 161, 148, 62, 69, 165, 24, 156, 25, 44, 34,
+                166, 17, 115, 252, 75, 105, 14, 252, 228, 57, 78, 44, 230, 91, 45, 221, 40, 10, 16,
+                1, 185, 150, 80, 49, 7, 210, 18, 118, 201, 115, 155, 49, 189, 239, 64, 11, 31, 167,
+                74, 249, 84, 113, 192, 169, 137, 13, 151, 119, 106, 146, 122, 145, 17
             ]
         );
 
         let mut bytes = vec![];
         encode_into(proof.iter(), &mut bytes);
-        let mut query = Query::new();
-        for item in queryitems {
-            query.insert_item(item);
-        }
-        let res = verify_query(bytes.as_slice(), &query, tree.hash()).unwrap();
-        assert_eq!(
-            res,
+        assert_verified_query_values(
+            bytes.as_slice(),
+            tree.hash(),
+            queryitems.as_slice(),
             vec![
                 (vec![1], vec![1]),
                 (vec![2], vec![2]),
                 (vec![3], vec![3]),
                 (vec![4], vec![4]),
-            ]
-        );
+            ],
+        )?;
+        assert_verified_values(
+            bytes.as_slice(),
+            tree.hash(),
+            &[
+                (vec![1], Some(vec![1])),
+                (vec![2], Some(vec![2])),
+                (vec![3], Some(vec![3])),
+                (vec![4], Some(vec![4])),
+            ],
+        )?;
         Ok(())
     }
 
@@ -1027,8 +1079,8 @@ mod test {
 
     #[test]
     fn range_proof() {
-        let mut tree = make_tree_seq(10);
-        let mut walker = RefWalker::new(&mut tree, PanicSource {});
+        let tree = make_tree_seq(10);
+        let walker = RefWalker::new(&tree);
 
         let queryitems = vec![QueryItem::Range(
             vec![0, 0, 0, 0, 0, 0, 0, 5]..vec![0, 0, 0, 0, 0, 0, 0, 7],
@@ -1040,24 +1092,24 @@ mod test {
         let mut iter = proof.iter();
         assert_eq!(
             iter.next(),
-            Some(&Op::Push(Node::Hash([
-                131, 182, 249, 107, 5, 43, 253, 172, 175, 5, 92, 100, 112, 7, 61, 179, 216, 127,
-                180, 104, 127, 239, 76, 175, 20, 208, 82, 101, 163, 177, 107, 229
+            Some(&Op::Push(Node::NodeHash([
+                225, 152, 183, 62, 249, 37, 189, 25, 150, 135, 171, 38, 135, 131, 58, 233, 61, 89,
+                243, 198, 60, 200, 234, 170, 190, 197, 90, 25, 52, 189, 2, 65
             ])))
         );
         assert_eq!(
             iter.next(),
             Some(&Op::Push(Node::KVHash([
-                252, 83, 231, 211, 74, 65, 100, 80, 251, 110, 182, 76, 90, 44, 213, 30, 241, 239,
-                2, 5, 216, 202, 184, 130, 47, 53, 146, 68, 179, 22, 45, 30
+                49, 10, 177, 169, 208, 39, 204, 220, 74, 172, 172, 196, 88, 59, 201, 97, 108, 135,
+                191, 148, 214, 89, 83, 140, 208, 113, 80, 137, 151, 104, 220, 138
             ])))
         );
         assert_eq!(iter.next(), Some(&Op::Parent));
         assert_eq!(
             iter.next(),
-            Some(&Op::Push(Node::Hash([
-                71, 142, 184, 184, 188, 130, 2, 241, 17, 17, 179, 82, 112, 27, 31, 20, 92, 69, 145,
-                176, 112, 235, 30, 16, 54, 157, 64, 114, 154, 54, 63, 253
+            Some(&Op::Push(Node::NodeHash([
+                218, 57, 4, 102, 52, 65, 175, 249, 60, 207, 219, 176, 186, 249, 46, 163, 9, 9, 237,
+                172, 69, 141, 86, 21, 26, 3, 209, 62, 14, 211, 217, 23
             ])))
         );
         assert_eq!(
@@ -1086,9 +1138,9 @@ mod test {
         assert_eq!(iter.next(), Some(&Op::Parent));
         assert_eq!(
             iter.next(),
-            Some(&Op::Push(Node::Hash([
-                150, 100, 68, 82, 53, 2, 5, 199, 230, 152, 77, 216, 114, 30, 205, 210, 226, 140,
-                161, 62, 235, 10, 116, 142, 115, 201, 56, 218, 44, 151, 86, 154
+            Some(&Op::Push(Node::NodeHash([
+                114, 190, 130, 81, 143, 185, 12, 157, 71, 145, 188, 22, 103, 48, 177, 157, 19, 101,
+                136, 144, 109, 124, 95, 88, 228, 213, 5, 149, 226, 7, 106, 2
             ])))
         );
         assert_eq!(iter.next(), Some(&Op::Child));
@@ -1098,24 +1150,31 @@ mod test {
 
         let mut bytes = vec![];
         encode_into(proof.iter(), &mut bytes);
-        let mut query = Query::new();
-        for item in queryitems {
-            query.insert_item(item);
-        }
-        let res = verify_query(bytes.as_slice(), &query, tree.hash()).unwrap();
-        assert_eq!(
-            res,
+        assert_verified_query_values(
+            bytes.as_slice(),
+            tree.hash(),
+            queryitems.as_slice(),
             vec![
                 (vec![0, 0, 0, 0, 0, 0, 0, 5], vec![123; 60]),
                 (vec![0, 0, 0, 0, 0, 0, 0, 6], vec![123; 60]),
-            ]
-        );
+            ],
+        )
+        .unwrap();
+        assert_verified_values(
+            bytes.as_slice(),
+            tree.hash(),
+            &[
+                (vec![0, 0, 0, 0, 0, 0, 0, 5], Some(vec![123; 60])),
+                (vec![0, 0, 0, 0, 0, 0, 0, 6], Some(vec![123; 60])),
+            ],
+        )
+        .unwrap();
     }
 
     #[test]
     fn range_proof_inclusive() {
-        let mut tree = make_tree_seq(10);
-        let mut walker = RefWalker::new(&mut tree, PanicSource {});
+        let tree = make_tree_seq(10);
+        let walker = RefWalker::new(&tree);
 
         let queryitems = vec![QueryItem::RangeInclusive(
             vec![0, 0, 0, 0, 0, 0, 0, 5]..=vec![0, 0, 0, 0, 0, 0, 0, 7],
@@ -1127,24 +1186,24 @@ mod test {
         let mut iter = proof.iter();
         assert_eq!(
             iter.next(),
-            Some(&Op::Push(Node::Hash([
-                131, 182, 249, 107, 5, 43, 253, 172, 175, 5, 92, 100, 112, 7, 61, 179, 216, 127,
-                180, 104, 127, 239, 76, 175, 20, 208, 82, 101, 163, 177, 107, 229
+            Some(&Op::Push(Node::NodeHash([
+                225, 152, 183, 62, 249, 37, 189, 25, 150, 135, 171, 38, 135, 131, 58, 233, 61, 89,
+                243, 198, 60, 200, 234, 170, 190, 197, 90, 25, 52, 189, 2, 65
             ])))
         );
         assert_eq!(
             iter.next(),
             Some(&Op::Push(Node::KVHash([
-                252, 83, 231, 211, 74, 65, 100, 80, 251, 110, 182, 76, 90, 44, 213, 30, 241, 239,
-                2, 5, 216, 202, 184, 130, 47, 53, 146, 68, 179, 22, 45, 30
+                49, 10, 177, 169, 208, 39, 204, 220, 74, 172, 172, 196, 88, 59, 201, 97, 108, 135,
+                191, 148, 214, 89, 83, 140, 208, 113, 80, 137, 151, 104, 220, 138
             ])))
         );
         assert_eq!(iter.next(), Some(&Op::Parent));
         assert_eq!(
             iter.next(),
-            Some(&Op::Push(Node::Hash([
-                71, 142, 184, 184, 188, 130, 2, 241, 17, 17, 179, 82, 112, 27, 31, 20, 92, 69, 145,
-                176, 112, 235, 30, 16, 54, 157, 64, 114, 154, 54, 63, 253
+            Some(&Op::Push(Node::NodeHash([
+                218, 57, 4, 102, 52, 65, 175, 249, 60, 207, 219, 176, 186, 249, 46, 163, 9, 9, 237,
+                172, 69, 141, 86, 21, 26, 3, 209, 62, 14, 211, 217, 23
             ])))
         );
         assert_eq!(
@@ -1173,9 +1232,9 @@ mod test {
         assert_eq!(iter.next(), Some(&Op::Parent));
         assert_eq!(
             iter.next(),
-            Some(&Op::Push(Node::Hash([
-                150, 100, 68, 82, 53, 2, 5, 199, 230, 152, 77, 216, 114, 30, 205, 210, 226, 140,
-                161, 62, 235, 10, 116, 142, 115, 201, 56, 218, 44, 151, 86, 154
+            Some(&Op::Push(Node::NodeHash([
+                114, 190, 130, 81, 143, 185, 12, 157, 71, 145, 188, 22, 103, 48, 177, 157, 19, 101,
+                136, 144, 109, 124, 95, 88, 228, 213, 5, 149, 226, 7, 106, 2
             ])))
         );
         assert_eq!(iter.next(), Some(&Op::Child));
@@ -1185,25 +1244,33 @@ mod test {
 
         let mut bytes = vec![];
         encode_into(proof.iter(), &mut bytes);
-        let mut query = Query::new();
-        for item in queryitems {
-            query.insert_item(item);
-        }
-        let res = verify_query(bytes.as_slice(), &query, tree.hash()).unwrap();
-        assert_eq!(
-            res,
+        assert_verified_query_values(
+            bytes.as_slice(),
+            tree.hash(),
+            queryitems.as_slice(),
             vec![
                 (vec![0, 0, 0, 0, 0, 0, 0, 5], vec![123; 60]),
                 (vec![0, 0, 0, 0, 0, 0, 0, 6], vec![123; 60]),
                 (vec![0, 0, 0, 0, 0, 0, 0, 7], vec![123; 60]),
-            ]
-        );
+            ],
+        )
+        .unwrap();
+        assert_verified_values(
+            bytes.as_slice(),
+            tree.hash(),
+            &[
+                (vec![0, 0, 0, 0, 0, 0, 0, 5], Some(vec![123; 60])),
+                (vec![0, 0, 0, 0, 0, 0, 0, 6], Some(vec![123; 60])),
+                (vec![0, 0, 0, 0, 0, 0, 0, 7], Some(vec![123; 60])),
+            ],
+        )
+        .unwrap();
     }
 
     #[test]
     fn range_proof_missing_upper_bound() {
-        let mut tree = make_tree_seq(10);
-        let mut walker = RefWalker::new(&mut tree, PanicSource {});
+        let tree = make_tree_seq(10);
+        let walker = RefWalker::new(&tree);
 
         let queryitems = vec![QueryItem::Range(
             vec![0, 0, 0, 0, 0, 0, 0, 5]..vec![0, 0, 0, 0, 0, 0, 0, 6, 5],
@@ -1215,24 +1282,24 @@ mod test {
         let mut iter = proof.iter();
         assert_eq!(
             iter.next(),
-            Some(&Op::Push(Node::Hash([
-                131, 182, 249, 107, 5, 43, 253, 172, 175, 5, 92, 100, 112, 7, 61, 179, 216, 127,
-                180, 104, 127, 239, 76, 175, 20, 208, 82, 101, 163, 177, 107, 229
+            Some(&Op::Push(Node::NodeHash([
+                225, 152, 183, 62, 249, 37, 189, 25, 150, 135, 171, 38, 135, 131, 58, 233, 61, 89,
+                243, 198, 60, 200, 234, 170, 190, 197, 90, 25, 52, 189, 2, 65
             ])))
         );
         assert_eq!(
             iter.next(),
             Some(&Op::Push(Node::KVHash([
-                252, 83, 231, 211, 74, 65, 100, 80, 251, 110, 182, 76, 90, 44, 213, 30, 241, 239,
-                2, 5, 216, 202, 184, 130, 47, 53, 146, 68, 179, 22, 45, 30
+                49, 10, 177, 169, 208, 39, 204, 220, 74, 172, 172, 196, 88, 59, 201, 97, 108, 135,
+                191, 148, 214, 89, 83, 140, 208, 113, 80, 137, 151, 104, 220, 138
             ])))
         );
         assert_eq!(iter.next(), Some(&Op::Parent));
         assert_eq!(
             iter.next(),
-            Some(&Op::Push(Node::Hash([
-                71, 142, 184, 184, 188, 130, 2, 241, 17, 17, 179, 82, 112, 27, 31, 20, 92, 69, 145,
-                176, 112, 235, 30, 16, 54, 157, 64, 114, 154, 54, 63, 253
+            Some(&Op::Push(Node::NodeHash([
+                218, 57, 4, 102, 52, 65, 175, 249, 60, 207, 219, 176, 186, 249, 46, 163, 9, 9, 237,
+                172, 69, 141, 86, 21, 26, 3, 209, 62, 14, 211, 217, 23
             ])))
         );
         assert_eq!(
@@ -1261,9 +1328,9 @@ mod test {
         assert_eq!(iter.next(), Some(&Op::Parent));
         assert_eq!(
             iter.next(),
-            Some(&Op::Push(Node::Hash([
-                150, 100, 68, 82, 53, 2, 5, 199, 230, 152, 77, 216, 114, 30, 205, 210, 226, 140,
-                161, 62, 235, 10, 116, 142, 115, 201, 56, 218, 44, 151, 86, 154
+            Some(&Op::Push(Node::NodeHash([
+                114, 190, 130, 81, 143, 185, 12, 157, 71, 145, 188, 22, 103, 48, 177, 157, 19, 101,
+                136, 144, 109, 124, 95, 88, 228, 213, 5, 149, 226, 7, 106, 2
             ])))
         );
         assert_eq!(iter.next(), Some(&Op::Child));
@@ -1273,24 +1340,31 @@ mod test {
 
         let mut bytes = vec![];
         encode_into(proof.iter(), &mut bytes);
-        let mut query = Query::new();
-        for item in queryitems {
-            query.insert_item(item);
-        }
-        let res = verify_query(bytes.as_slice(), &query, tree.hash()).unwrap();
-        assert_eq!(
-            res,
+        assert_verified_query_values(
+            bytes.as_slice(),
+            tree.hash(),
+            queryitems.as_slice(),
             vec![
                 (vec![0, 0, 0, 0, 0, 0, 0, 5], vec![123; 60]),
                 (vec![0, 0, 0, 0, 0, 0, 0, 6], vec![123; 60]),
-            ]
-        );
+            ],
+        )
+        .unwrap();
+        assert_verified_values(
+            bytes.as_slice(),
+            tree.hash(),
+            &[
+                (vec![0, 0, 0, 0, 0, 0, 0, 5], Some(vec![123; 60])),
+                (vec![0, 0, 0, 0, 0, 0, 0, 6], Some(vec![123; 60])),
+            ],
+        )
+        .unwrap();
     }
 
     #[test]
     fn range_proof_missing_lower_bound() {
-        let mut tree = make_tree_seq(10);
-        let mut walker = RefWalker::new(&mut tree, PanicSource {});
+        let tree = make_tree_seq(10);
+        let walker = RefWalker::new(&tree);
 
         let queryitems = vec![
             // 7 is not inclusive
@@ -1303,24 +1377,24 @@ mod test {
         let mut iter = proof.iter();
         assert_eq!(
             iter.next(),
-            Some(&Op::Push(Node::Hash([
-                131, 182, 249, 107, 5, 43, 253, 172, 175, 5, 92, 100, 112, 7, 61, 179, 216, 127,
-                180, 104, 127, 239, 76, 175, 20, 208, 82, 101, 163, 177, 107, 229
+            Some(&Op::Push(Node::NodeHash([
+                225, 152, 183, 62, 249, 37, 189, 25, 150, 135, 171, 38, 135, 131, 58, 233, 61, 89,
+                243, 198, 60, 200, 234, 170, 190, 197, 90, 25, 52, 189, 2, 65
             ])))
         );
         assert_eq!(
             iter.next(),
             Some(&Op::Push(Node::KVHash([
-                252, 83, 231, 211, 74, 65, 100, 80, 251, 110, 182, 76, 90, 44, 213, 30, 241, 239,
-                2, 5, 216, 202, 184, 130, 47, 53, 146, 68, 179, 22, 45, 30
+                49, 10, 177, 169, 208, 39, 204, 220, 74, 172, 172, 196, 88, 59, 201, 97, 108, 135,
+                191, 148, 214, 89, 83, 140, 208, 113, 80, 137, 151, 104, 220, 138
             ])))
         );
         assert_eq!(iter.next(), Some(&Op::Parent));
         assert_eq!(
             iter.next(),
-            Some(&Op::Push(Node::Hash([
-                71, 142, 184, 184, 188, 130, 2, 241, 17, 17, 179, 82, 112, 27, 31, 20, 92, 69, 145,
-                176, 112, 235, 30, 16, 54, 157, 64, 114, 154, 54, 63, 253
+            Some(&Op::Push(Node::NodeHash([
+                218, 57, 4, 102, 52, 65, 175, 249, 60, 207, 219, 176, 186, 249, 46, 163, 9, 9, 237,
+                172, 69, 141, 86, 21, 26, 3, 209, 62, 14, 211, 217, 23
             ])))
         );
         assert_eq!(
@@ -1349,9 +1423,9 @@ mod test {
         assert_eq!(iter.next(), Some(&Op::Parent));
         assert_eq!(
             iter.next(),
-            Some(&Op::Push(Node::Hash([
-                150, 100, 68, 82, 53, 2, 5, 199, 230, 152, 77, 216, 114, 30, 205, 210, 226, 140,
-                161, 62, 235, 10, 116, 142, 115, 201, 56, 218, 44, 151, 86, 154
+            Some(&Op::Push(Node::NodeHash([
+                114, 190, 130, 81, 143, 185, 12, 157, 71, 145, 188, 22, 103, 48, 177, 157, 19, 101,
+                136, 144, 109, 124, 95, 88, 228, 213, 5, 149, 226, 7, 106, 2
             ])))
         );
         assert_eq!(iter.next(), Some(&Op::Child));
@@ -1361,12 +1435,19 @@ mod test {
 
         let mut bytes = vec![];
         encode_into(proof.iter(), &mut bytes);
-        let mut query = Query::new();
-        for item in queryitems {
-            query.insert_item(item);
-        }
-        let res = verify_query(bytes.as_slice(), &query, tree.hash()).unwrap();
-        assert_eq!(res, vec![(vec![0, 0, 0, 0, 0, 0, 0, 6], vec![123; 60]),]);
+        assert_verified_query_values(
+            bytes.as_slice(),
+            tree.hash(),
+            queryitems.as_slice(),
+            vec![(vec![0, 0, 0, 0, 0, 0, 0, 6], vec![123; 60])],
+        )
+        .unwrap();
+        assert_verified_values(
+            bytes.as_slice(),
+            tree.hash(),
+            &[(vec![0, 0, 0, 0, 0, 0, 0, 6], Some(vec![123; 60]))],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1390,16 +1471,16 @@ mod test {
             vec![0, 0, 0, 0, 0, 0, 5, 5]..vec![0, 0, 0, 0, 0, 0, 0, 7],
         ));
         let query_vec: Vec<QueryItem> = query.into();
-        let expected = vec![QueryItem::Range(
+        let expected = [QueryItem::Range(
             vec![0, 0, 0, 0, 0, 0, 5, 5]..vec![0, 0, 0, 0, 0, 0, 0, 7],
         )];
         assert_eq!(
-            query_vec.get(0).unwrap().lower_bound(),
-            expected.get(0).unwrap().lower_bound()
+            query_vec.first().unwrap().lower_bound(),
+            expected.first().unwrap().lower_bound()
         );
         assert_eq!(
-            query_vec.get(0).unwrap().upper_bound(),
-            expected.get(0).unwrap().upper_bound()
+            query_vec.first().unwrap().upper_bound(),
+            expected.first().unwrap().upper_bound()
         );
     }
 
@@ -1414,11 +1495,11 @@ mod test {
 
     #[test]
     fn verify_ops() -> Result<()> {
-        let mut tree = Tree::new(vec![5], vec![5])?;
-        tree.commit(&mut NoopCommit {}).expect("commit failed");
+        let mut tree = TreeNode::new(vec![5], vec![5])?;
+        tree.commit();
 
         let root_hash = tree.hash();
-        let mut walker = RefWalker::new(&mut tree, PanicSource {});
+        let walker = RefWalker::new(&tree);
 
         let (proof, _) = walker
             .create_proof(vec![QueryItem::Key(vec![5])].as_slice())
@@ -1438,10 +1519,10 @@ mod test {
     #[test]
     #[should_panic(expected = "verify failed")]
     fn verify_ops_mismatched_hash() {
-        let mut tree = Tree::new(vec![5], vec![5]).expect("tree construction failed");
-        tree.commit(&mut NoopCommit {}).expect("commit failed");
+        let mut tree = TreeNode::new(vec![5], vec![5]).expect("tree construction failed");
+        tree.commit();
 
-        let mut walker = RefWalker::new(&mut tree, PanicSource {});
+        let walker = RefWalker::new(&tree);
 
         let (proof, _) = walker
             .create_proof(vec![QueryItem::Key(vec![5])].as_slice())
@@ -1456,12 +1537,11 @@ mod test {
     #[test]
     #[should_panic(expected = "verify failed")]
     fn verify_query_mismatched_hash() {
-        let mut tree = make_3_node_tree().expect("tree construction failed");
-        let mut walker = RefWalker::new(&mut tree, PanicSource {});
-        let keys = vec![vec![5], vec![7]];
+        let tree = make_3_node_tree().expect("tree construction failed");
+        let walker = RefWalker::new(&tree);
         let (proof, _) = walker
             .create_proof(
-                keys.clone()
+                vec![vec![5], vec![7]]
                     .into_iter()
                     .map(QueryItem::Key)
                     .collect::<Vec<_>>()
@@ -1471,25 +1551,23 @@ mod test {
         let mut bytes = vec![];
         encode_into(proof.iter(), &mut bytes);
 
-        let mut query = Query::new();
-        for key in keys.iter() {
-            query.insert_key(key.clone());
-        }
-
+        let query = query_from_items(&[QueryItem::Key(vec![5]), QueryItem::Key(vec![7])]);
         let _result = verify_query(bytes.as_slice(), &query, [42; 32]).expect("verify failed");
     }
 
     #[test]
-    #[should_panic(expected = "Tried to attach to Hash node")]
+    #[should_panic(expected = "Tried to attach to NodeHash node")]
     fn hash_attach() {
-        let mut target = make_3_node_tree().expect("tree construction failed");
+        let target = make_3_node_tree().expect("tree construction failed");
 
-        let mut proof = Vec::new();
-        proof.push(Op::Push(Node::KV(vec![42], vec![42])));
-        proof.push(Op::Push(Node::Hash(target.hash())));
-        proof.push(Op::Parent);
+        let proof = vec![
+            Op::Push(Node::KV(vec![42], vec![42])),
+            Op::Push(Node::NodeHash(target.hash())),
+            Op::Parent,
+        ];
 
-        let map = verify(&proof.encode().unwrap(), target.hash()).unwrap();
-        assert_eq!(map.get(&[42]).unwrap().unwrap(), &[42])
+        let query = query_from_items(&[QueryItem::Key(vec![42])]);
+        let result = verify_query(&proof.encode().unwrap(), &query, target.hash()).unwrap();
+        assert_eq!(result, vec![(vec![42], vec![42])])
     }
 }

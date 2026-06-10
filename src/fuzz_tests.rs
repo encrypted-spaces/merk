@@ -1,7 +1,5 @@
-#![cfg(test)]
-
 use crate::test_utils::*;
-use crate::tree::*;
+use crate::*;
 use rand::prelude::*;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -56,7 +54,7 @@ fn fuzz_case(seed: u64) {
     }
 }
 
-fn make_batch(maybe_tree: Option<&Tree>, size: u64, seed: u64) -> Vec<BatchEntry> {
+fn make_batch(maybe_tree: Option<&Node>, size: u64, seed: u64) -> Vec<BatchEntry> {
     let rng: RefCell<SmallRng> = RefCell::new(SeedableRng::seed_from_u64(seed));
     let mut batch = Vec::with_capacity(size as usize);
 
@@ -129,7 +127,71 @@ fn apply_to_map(map: &mut Map, batch: &Batch) {
     }
 }
 
-fn assert_map(maybe_tree: Option<&Tree>, map: &Map) {
+#[test]
+fn fuzz_in_place_parity() {
+    let mut rng = thread_rng();
+
+    for _ in 0..ITERATIONS {
+        let seed = rng.gen::<u64>();
+        fuzz_in_place_case(seed);
+    }
+}
+
+fn fuzz_in_place_case(seed: u64) {
+    use crate::ops::PanicSource;
+    use crate::walker::Walker;
+
+    let mut rng: SmallRng = SeedableRng::seed_from_u64(seed);
+    let initial_size = (rng.gen::<u64>() % 10) + 1;
+    let tree = make_tree_rand(initial_size, initial_size, seed);
+    let mut maybe_tree_func = Some(tree.clone());
+    let mut maybe_tree_ip = Some(tree);
+
+    for _ in 0..3 {
+        let batch_size = (rng.gen::<u64>() % 3) + 1;
+        let batch = make_batch(maybe_tree_func.as_ref(), batch_size, rng.gen::<u64>());
+
+        maybe_tree_func = apply_to_memonly(maybe_tree_func, &batch);
+
+        match &maybe_tree_ip {
+            Some(tree_ip) => {
+                let mut walker = Walker::new(tree_ip.clone(), PanicSource {});
+                let mut batch_mut = batch.to_vec();
+                match walker.apply_in_place(&mut batch_mut) {
+                    Ok(_deleted_keys) => {
+                        let mut t = walker.into_inner();
+                        t.commit();
+                        assert_tree_invariants(&t);
+
+                        match &maybe_tree_func {
+                            Some(func) => {
+                                assert_eq!(func.hash(), t.hash(), "hash mismatch at seed {}", seed,);
+                            }
+                            None => {
+                                panic!(
+                                    "functional path returned None but in-place succeeded (seed {})",
+                                    seed,
+                                );
+                            }
+                        }
+                        maybe_tree_ip = Some(t);
+                    }
+                    Err(_) => {
+                        assert!(
+                            maybe_tree_func.is_none(),
+                            "in-place errored but functional path returned Some (seed {})",
+                            seed,
+                        );
+                        return;
+                    }
+                }
+            }
+            None => return,
+        }
+    }
+}
+
+fn assert_map(maybe_tree: Option<&Node>, map: &Map) {
     if map.is_empty() {
         assert!(maybe_tree.is_none(), "expected tree to be None");
         return;
@@ -137,9 +199,9 @@ fn assert_map(maybe_tree: Option<&Tree>, map: &Map) {
 
     let tree = maybe_tree.expect("expected tree to be Some");
 
-    let map_iter = map.iter();
+    let expected_iter = map.iter();
     let tree_iter = tree.iter();
-    for (tree_kv, map_kv) in tree_iter.zip(map_iter) {
+    for (tree_kv, map_kv) in tree_iter.zip(expected_iter) {
         assert_eq!(tree_kv.0, *map_kv.0);
         assert_eq!(tree_kv.1, *map_kv.1);
     }

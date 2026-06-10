@@ -1,13 +1,12 @@
-pub mod chunk;
 pub mod encoding;
+pub mod proof_tree;
 pub mod query;
-pub mod tree;
 
-use crate::tree::Hash;
+use crate::hash::Hash;
 
 pub use encoding::{encode_into, Decoder};
+pub use proof_tree::ProofTree;
 pub use query::Query;
-pub use tree::Tree;
 
 /// A proof operator, executed to verify the data in a Merkle proof.
 #[derive(Debug, PartialEq)]
@@ -30,8 +29,8 @@ pub enum Op {
 /// `Push` operator in a proof.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Node {
-    /// Represents the hash of a tree node.
-    Hash(Hash),
+    /// Represents the hash of a tree node (the complete subtree commitment).
+    NodeHash(Hash),
 
     /// Represents the hash of the key/value pair of a tree node.
     KVHash(Hash),

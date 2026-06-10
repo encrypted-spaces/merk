@@ -1,13 +1,13 @@
 use super::{Node, Op};
 use crate::error::{Error, Result};
-use crate::tree::{kv_hash, node_hash, Hash, Hasher, NULL_HASH};
+use crate::hash::{kv_hash, node_hash, Hash, Hasher, NULL_HASH};
 
 /// Contains a tree's child node and its hash. The hash can always be assumed to
 /// be up-to-date.
 #[derive(Debug)]
-pub struct Child {
+pub struct ProofChild {
     /// The child node.
-    pub tree: Box<Tree>,
+    pub tree: Box<ProofTree>,
     /// The hash of the child node.
     pub hash: Hash,
 }
@@ -15,21 +15,21 @@ pub struct Child {
 /// A binary tree data structure used to represent a select subset of a tree
 /// when verifying Merkle proofs.
 #[derive(Debug)]
-pub struct Tree {
+pub struct ProofTree {
     /// The node at the root of this tree.
     pub node: Node,
     /// The left child of this tree.
-    pub left: Option<Child>,
+    pub left: Option<ProofChild>,
     /// The right child of this tree.
-    pub right: Option<Child>,
+    pub right: Option<ProofChild>,
     /// The height of this tree.
     pub height: usize,
 }
 
-impl From<Node> for Tree {
+impl From<Node> for ProofTree {
     /// Creates a childless tree with the target node as the `node` field.
     fn from(node: Node) -> Self {
-        Tree {
+        ProofTree {
             node,
             left: None,
             right: None,
@@ -38,7 +38,7 @@ impl From<Node> for Tree {
     }
 }
 
-impl PartialEq for Tree {
+impl PartialEq for ProofTree {
     /// Checks equality for the root hashes of the two trees.
     fn eq(&self, other: &Self) -> bool {
         self.hash()
@@ -47,15 +47,15 @@ impl PartialEq for Tree {
     }
 }
 
-impl Tree {
+impl ProofTree {
     /// Gets or computes the hash for this tree node.
     pub fn hash(&self) -> Result<Hash> {
-        fn compute_hash(tree: &Tree, kv_hash: Hash) -> Hash {
+        fn compute_hash(tree: &ProofTree, kv_hash: Hash) -> Hash {
             node_hash::<Hasher>(&kv_hash, &tree.child_hash(true), &tree.child_hash(false))
         }
 
         match &self.node {
-            Node::Hash(hash) => Ok(*hash),
+            Node::NodeHash(hash) => Ok(*hash),
             Node::KVHash(kv_hash) => Ok(compute_hash(self, *kv_hash)),
             Node::KV(key, value) => kv_hash::<Hasher>(key.as_slice(), value.as_slice())
                 .map(|kv_hash| compute_hash(self, kv_hash))
@@ -65,7 +65,7 @@ impl Tree {
 
     /// Creates an iterator that yields the in-order traversal of the nodes at
     /// the given depth.
-    pub fn layer(&self, depth: usize) -> LayerIter {
+    pub fn layer(&self, depth: usize) -> LayerIter<'_> {
         LayerIter::new(self, depth)
     }
 
@@ -86,7 +86,7 @@ impl Tree {
 
     /// Does an in-order traversal over references to all the nodes in the tree,
     /// calling `visit_node` for each.
-    pub fn visit_refs<F: FnMut(&Tree)>(&self, visit_node: &mut F) {
+    pub fn visit_refs<F: FnMut(&ProofTree)>(&self, visit_node: &mut F) {
         if let Some(child) = &self.left {
             child.tree.visit_refs(visit_node);
         }
@@ -99,7 +99,7 @@ impl Tree {
     }
 
     /// Returns an immutable reference to the child on the given side, if any.
-    pub fn child(&self, left: bool) -> Option<&Child> {
+    pub fn child(&self, left: bool) -> Option<&ProofChild> {
         if left {
             self.left.as_ref()
         } else {
@@ -108,7 +108,7 @@ impl Tree {
     }
 
     /// Returns a mutable reference to the child on the given side, if any.
-    pub(crate) fn child_mut(&mut self, left: bool) -> &mut Option<Child> {
+    pub(crate) fn child_mut(&mut self, left: bool) -> &mut Option<ProofChild> {
         if left {
             &mut self.left
         } else {
@@ -118,22 +118,22 @@ impl Tree {
 
     /// Attaches the child to the `Tree`'s given side. Returns an error if
     /// there is already a child attached to this side.
-    pub(crate) fn attach(&mut self, left: bool, child: Tree) -> Result<()> {
+    pub(crate) fn attach(&mut self, left: bool, child: ProofTree) -> Result<()> {
         if self.child(left).is_some() {
             return Err(Error::Attach(
                 "Tried to attach to left child, but it is already Some".into(),
             ));
         }
 
-        if let Node::Hash(_) = self.node {
-            return Err(Error::Attach("Tried to attach to Hash node".into()));
+        if let Node::NodeHash(_) = self.node {
+            return Err(Error::Attach("Tried to attach to NodeHash node".into()));
         }
 
         self.height = self.height.max(child.height + 1);
 
         let hash = child.hash()?;
         let tree = Box::new(child);
-        *self.child_mut(left) = Some(Child { tree, hash });
+        *self.child_mut(left) = Some(ProofChild { tree, hash });
 
         Ok(())
     }
@@ -146,31 +146,23 @@ impl Tree {
         self.child(left).map_or(NULL_HASH, |c| c.hash)
     }
 
-    /// Consumes the tree node, calculates its hash, and returns a `Node::Hash`
+    /// Consumes the tree node, calculates its hash, and returns a `Node::NodeHash`
     /// variant.
-    fn try_into_hash(self) -> Result<Tree> {
-        self.hash().map(Node::Hash).map(Into::into)
-    }
-
-    #[cfg(feature = "full")]
-    pub(crate) fn key(&self) -> &[u8] {
-        match self.node {
-            Node::KV(ref key, _) => key,
-            _ => panic!("Expected node to be type KV"),
-        }
+    fn try_into_hash(self) -> Result<ProofTree> {
+        self.hash().map(Node::NodeHash).map(Into::into)
     }
 }
 
 /// `LayerIter` iterates over the nodes in a `Tree` at a given depth. Nodes are
 /// visited in order.
 pub struct LayerIter<'a> {
-    stack: Vec<&'a Tree>,
+    stack: Vec<&'a ProofTree>,
     depth: usize,
 }
 
 impl<'a> LayerIter<'a> {
     /// Creates a new `LayerIter` that iterates over `tree` at the given depth.
-    fn new(tree: &'a Tree, depth: usize) -> Self {
+    fn new(tree: &'a ProofTree, depth: usize) -> Self {
         let mut iter = LayerIter {
             stack: Vec::with_capacity(depth),
             depth,
@@ -182,7 +174,7 @@ impl<'a> LayerIter<'a> {
 
     /// Builds up the stack by traversing through left children to the desired
     /// depth.
-    fn traverse_to_start(&mut self, tree: &'a Tree, remaining_depth: usize) {
+    fn traverse_to_start(&mut self, tree: &'a ProofTree, remaining_depth: usize) {
         self.stack.push(tree);
 
         if remaining_depth == 0 {
@@ -198,7 +190,7 @@ impl<'a> LayerIter<'a> {
 }
 
 impl<'a> Iterator for LayerIter<'a> {
-    type Item = &'a Tree;
+    type Item = &'a ProofTree;
 
     fn next(&mut self) -> Option<Self::Item> {
         let item = self.stack.pop();
@@ -236,21 +228,21 @@ impl<'a> Iterator for LayerIter<'a> {
 /// If the `collapse` option is set to `true`, nodes will be hashed and pruned
 /// from memory during execution. This results in the minimum amount of memory
 /// usage, and the returned `Tree` will only contain a single node of type
-/// `Node::Hash`. If `false`, the returned `Tree` will contain the entire
+/// `Node::NodeHash`. If `false`, the returned `Tree` will contain the entire
 /// subtree contained in the proof.
 ///
 /// `visit_node` will be called once for every push operation in the proof, in
 /// key-order. If `visit_node` returns an `Err` result, it will halt the
 /// execution and `execute` will return the error.
-pub(crate) fn execute<I, F>(ops: I, collapse: bool, mut visit_node: F) -> Result<Tree>
+pub(crate) fn execute<I, F>(ops: I, collapse: bool, mut visit_node: F) -> Result<ProofTree>
 where
     I: IntoIterator<Item = Result<Op>>,
     F: FnMut(&Node) -> Result<()>,
 {
-    let mut stack: Vec<Tree> = Vec::with_capacity(32);
+    let mut stack: Vec<ProofTree> = Vec::with_capacity(32);
     let mut maybe_last_key = None;
 
-    fn try_pop(stack: &mut Vec<Tree>) -> Result<Tree> {
+    fn try_pop(stack: &mut Vec<ProofTree>) -> Result<ProofTree> {
         match stack.pop() {
             None => Err(Error::StackUnderflow),
             Some(tree) => Ok(tree),
@@ -297,7 +289,7 @@ where
 
                 visit_node(&node)?;
 
-                let tree: Tree = node.into();
+                let tree: ProofTree = node.into();
                 stack.push(tree);
             }
         }
@@ -315,11 +307,11 @@ where
 #[cfg(test)]
 mod test {
     use super::super::*;
-    use super::Tree as ProofTree;
+
     use super::*;
 
     fn make_7_node_prooftree() -> ProofTree {
-        let make_node = |i| -> super::super::tree::Tree { Node::KV(vec![i], vec![]).into() };
+        let make_node = |i| -> ProofTree { Node::KV(vec![i], vec![]).into() };
 
         let mut tree = make_node(3);
         let mut left = make_node(1);
@@ -336,7 +328,7 @@ mod test {
 
     #[test]
     fn height_counting() {
-        fn recurse(tree: &super::Tree, expected_height: usize) {
+        fn recurse(tree: &super::ProofTree, expected_height: usize) {
             assert_eq!(tree.height, expected_height);
             tree.left
                 .as_ref()
@@ -356,7 +348,7 @@ mod test {
     fn layer_iter() {
         let tree = make_7_node_prooftree();
 
-        let assert_node = |node: &Tree, i| match node.node {
+        let assert_node = |node: &ProofTree, i| match node.node {
             Node::KV(ref key, _) => assert_eq!(key[0], i),
             _ => unreachable!(),
         };

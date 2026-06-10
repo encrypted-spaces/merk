@@ -4,12 +4,12 @@ use ed::{Decode, Encode, Terminated};
 
 use super::{Node, Op};
 use crate::error::Result;
-use crate::tree::HASH_LENGTH;
+use crate::hash::HASH_LENGTH;
 
 impl Encode for Op {
     fn encode_into<W: Write>(&self, dest: &mut W) -> ed::Result<()> {
         match self {
-            Op::Push(Node::Hash(hash)) => {
+            Op::Push(Node::NodeHash(hash)) => {
                 dest.write_all(&[0x01])?;
                 dest.write_all(hash)?;
             }
@@ -34,7 +34,7 @@ impl Encode for Op {
 
     fn encoding_length(&self) -> ed::Result<usize> {
         Ok(match self {
-            Op::Push(Node::Hash(_)) => 1 + HASH_LENGTH,
+            Op::Push(Node::NodeHash(_)) => 1 + HASH_LENGTH,
             Op::Push(Node::KVHash(_)) => 1 + HASH_LENGTH,
             Op::Push(Node::KV(key, value)) => 5 + key.len() + value.len(),
             Op::Parent => 1,
@@ -51,7 +51,7 @@ impl Decode for Op {
             0x01 => {
                 let mut hash = [0; HASH_LENGTH];
                 input.read_exact(&mut hash)?;
-                Op::Push(Node::Hash(hash))
+                Op::Push(Node::NodeHash(hash))
             }
             0x02 => {
                 let mut hash = [0; HASH_LENGTH];
@@ -134,11 +134,11 @@ impl<'a> Iterator for Decoder<'a> {
 #[cfg(test)]
 mod test {
     use super::super::{Node, Op};
-    use crate::tree::HASH_LENGTH;
+    use crate::hash::HASH_LENGTH;
 
     #[test]
     fn encode_push_hash() {
-        let op = Op::Push(Node::Hash([123; HASH_LENGTH]));
+        let op = Op::Push(Node::NodeHash([123; HASH_LENGTH]));
         assert_eq!(op.encoding_length(), 1 + HASH_LENGTH);
 
         let mut bytes = vec![];
@@ -201,6 +201,7 @@ mod test {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic]
     fn encode_push_kv_long_key() {
         let op = Op::Push(Node::KV(vec![123; 70_000], vec![4, 5, 6]));
@@ -215,7 +216,7 @@ mod test {
             123, 123, 123, 123, 123, 123, 123, 123, 123, 123, 123, 123, 123, 123, 123, 123,
         ];
         let op = Op::decode(&bytes[..]).expect("decode failed");
-        assert_eq!(op, Op::Push(Node::Hash([123; HASH_LENGTH])));
+        assert_eq!(op, Op::Push(Node::NodeHash([123; HASH_LENGTH])));
     }
 
     #[test]

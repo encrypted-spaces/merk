@@ -6,45 +6,33 @@ authors = ["Turbofish <team@turbofish.org>"]
 edition = "2018"
 license = "Apache-2.0"
 
+[workspace]
+
 [dependencies]
 thiserror= "1.0.58"
-sha2 = "0.10.8"
-log = "0.4.21"
-
-[dependencies.colored]
-version = "2.1.0"
-optional = true
-
-[dependencies.num_cpus]
-version = "1.16.0"
-optional = true
+# Use RISC0's accelerated SHA256 when compiled for guest.  To compile for RISC0 use this crate with default-features=false
+sha2 = { git = "https://github.com/risc0/RustCrypto-hashes", tag = "sha2-v0.10.8-risczero.0" }
 
 [dependencies.ed]
-version = "0.3.0"
-optional = true
+version = "0.2"
 
 [dependencies.rand]
 version = "0.8.5"
 features = ["small_rng"]
 optional = true
 
-[dependencies.rocksdb]
-version = "0.22.0"
-default-features = false
-optional = true
-
-[dependencies.jemallocator]
-version = "0.5.4"
-features = ["disable_initial_exec_tls"]
-optional = true
-
 [features]
-default = ["full", "verify"]
-full = [
-    "rand",
-    "rocksdb",
-    "colored",
-    "num_cpus",
-    "ed",
-]
-verify = ["ed"]
+bench = ["dep:rand"]
+box = []
+
+[dev-dependencies.rand]
+version = "0.8.5"
+features = ["small_rng"]
+
+[dev-dependencies.criterion]
+version = "0.5"
+
+[[bench]]
+name = "ops"
+harness = false
+required-features = ["bench"]

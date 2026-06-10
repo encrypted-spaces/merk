@@ -8,12 +8,12 @@ pub enum Error {
     BatchKey(String),
     #[error("Bound Error: {0}")]
     Bound(String),
-    #[error("Chunk Processing Error: {0}")]
-    ChunkProcessing(String),
     #[error(transparent)]
     Ed(#[from] ed::Error),
     #[error("Fetch Error: {0}")]
     Fetch(String),
+    #[error("Hash Error: {0}")]
+    Hash(String),
     #[error("Proof did not match expected hash\n\tExpected: {0:?}\n\tActual: {1:?}")]
     HashMismatch([u8; 32], [u8; 32]),
     #[error("Index OoB Error: {0}")]
@@ -34,9 +34,6 @@ pub enum Error {
     Path(String),
     #[error("Proof Error: {0}")]
     Proof(String),
-    #[cfg(feature = "full")]
-    #[error(transparent)]
-    RocksDB(#[from] rocksdb::Error),
     #[error("Stack Underflow")]
     StackUnderflow,
     #[error("Tree Error: {0}")]

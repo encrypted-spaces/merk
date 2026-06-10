@@ -10,166 +10,48 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test-base:
+  test:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
-      - name: Use Nightly
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: nightly-2024-04-25
-          override: true
+        uses: actions/checkout@v6
       - name: Cache
-        uses: actions/cache@v3
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/bin/
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            ~/.cargo/registry/src/**/librocksdb-sys-*
             target/
-          key: ${{ runner.os }}-test-base-${{ hashFiles('Cargo.toml') }}
+          key: ${{ runner.os }}-test-${{ hashFiles('Cargo.toml') }}
       - name: Test
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --verbose
-
-  test-all-features:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-      - name: Use Nightly
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: nightly-2024-04-25
-          override: true
-      - name: Cache
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            ~/.cargo/registry/src/**/librocksdb-sys-*
-            target/
-          key: ${{ runner.os }}-test-all-features-${{ hashFiles('Cargo.toml') }}
-      - name: Test
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --verbose --all-features
-
-  coverage:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-      - name: Use Nightly
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: nightly-2024-04-25
-          components: llvm-tools-preview
-          override: true
-      - name: Cache
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            ~/.cargo/registry/src/**/librocksdb-sys-*
-            target/
-          key: ${{ runner.os }}-coverage-${{ hashFiles('Cargo.toml') }}
-      - name: Install Coverage Tooling
-        uses: actions-rs/cargo@v1
-        with:
-          command: install
-          args: cargo-llvm-cov --force
-      - name: Run Coverage
-        uses: actions-rs/cargo@v1
-        with:
-          command: llvm-cov
-          args: --all-features --workspace --lcov --output-path lcov.info
-      - name: Upload to codecov.io
-        uses: codecov/codecov-action@v1
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: lcov.info
-          fail_ci_if_error: true
+        run: cargo test --verbose
+      - name: Test (box)
+        run: cargo test --verbose --features box
 
   format:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
-      - name: Use Nightly
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: nightly-2024-04-25
-          components: rustfmt
-          override: true
+        uses: actions/checkout@v6
       - name: Check
-        uses: actions-rs/cargo@v1
-        with:
-          command: fmt
-          args: --all -- --check
+        run: cargo fmt --all -- --check
 
   clippy:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
-      - name: Use Nightly
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: nightly-2024-04-25
-          components: clippy
-          override: true
+        uses: actions/checkout@v6
       - name: Cache
-        uses: actions/cache@v3
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/bin/
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            ~/.cargo/registry/src/**/librocksdb-sys-*
             target/
           key: ${{ runner.os }}-clippy-${{ hashFiles('Cargo.toml') }}
-      - name: Check
-        uses: actions-rs/clippy-check@v1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          args: --all-features -- -D warnings
-
-  benches:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-      - name: Use Nightly
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: nightly-2024-04-25
-          override: true
-      - name: Cache
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            ~/.cargo/registry/src/**/librocksdb-sys-*
-            target/
-          key: ${{ runner.os }}-benches-${{ hashFiles('Cargo.toml') }}
-      - name: Run Benches
-        uses: actions-rs/cargo@v1
-        with:
-          command: bench
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
