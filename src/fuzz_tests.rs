@@ -1,3 +1,4 @@
+use crate::avl::node::Node;
 use crate::test_utils::*;
 use crate::*;
 use rand::prelude::*;
@@ -123,6 +124,15 @@ fn apply_to_map(map: &mut Map, batch: &Batch) {
             (key, Op::Delete) => {
                 map.remove(key);
             }
+            (start, Op::DeleteRange(end)) => {
+                let keys_to_remove: Vec<Vec<u8>> = map
+                    .range(start.to_vec()..end.to_vec())
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for k in keys_to_remove {
+                    map.remove(&k);
+                }
+            }
         }
     }
 }
@@ -138,8 +148,8 @@ fn fuzz_in_place_parity() {
 }
 
 fn fuzz_in_place_case(seed: u64) {
-    use crate::ops::PanicSource;
-    use crate::walker::Walker;
+    use crate::avl::walker::Walker;
+    use crate::avl::PanicSource;
 
     let mut rng: SmallRng = SeedableRng::seed_from_u64(seed);
     let initial_size = (rng.gen::<u64>() % 10) + 1;

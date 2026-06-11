@@ -1,7 +1,7 @@
-use crate::child::Child;
+use crate::avl::child::Child;
+use crate::avl::node::Node;
 use crate::error::{Error, Result};
 use crate::hash::Hash;
-use crate::node::Node;
 
 /// A source of data to be used by the tree when encountering a pruned node.
 pub trait Fetch {
@@ -15,6 +15,11 @@ pub trait Fetch {
         self.fetch_by_key(key)?
             .ok_or_else(|| Error::Key(format!("Key does not exist: {key:?}")))
     }
+
+    /// Called by the walker for every node the apply machinery descends
+    /// past. Tracing sources override this to record visited nodes; the
+    /// default impl is a no-op so non-tracing sources are unaffected.
+    fn record_visit(&self, _node: &Node) {}
 }
 
 /// Allows immutable traversal of a fully-resident `Node` tree.
@@ -69,6 +74,8 @@ where
     /// same source as `self`. Returned tuple is `(updated_self,
     /// maybe_child_walker)`.
     pub fn detach(mut self, left: bool) -> Result<(Self, Option<Self>)> {
+        self.source.record_visit(&self.tree);
+
         let child_meta = match self.tree.child_ref(left) {
             None => return Ok((self, None)),
             Some(child) => child,
@@ -100,6 +107,8 @@ where
             }
             child
         };
+
+        self.source.record_visit(&child);
 
         let child = self.wrap(child);
         Ok((self, Some(child)))
@@ -207,6 +216,11 @@ where
         self.source.clone()
     }
 
+    /// Delegates to `Fetch::record_visit` on the walker's source.
+    pub fn record_visit_node(&self, node: &Node) {
+        self.source.record_visit(node);
+    }
+
     /// Similar to `Node#attach`, but can also take a `Walker` since it
     /// implements `Into<Node>`.
     pub fn attach<T>(mut self, left: bool, maybe_child: Option<T>) -> Self
@@ -236,8 +250,8 @@ where
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::child::Child;
-    use crate::node::Node;
+    use crate::avl::child::Child;
+    use crate::avl::node::Node;
 
     #[derive(Clone)]
     struct MockSource {}

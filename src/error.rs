@@ -1,5 +1,20 @@
 pub use thiserror::Error;
 
+use core::fmt;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnsupportedFeature {
+    MovePrefix,
+}
+
+impl fmt::Display for UnsupportedFeature {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            UnsupportedFeature::MovePrefix => f.write_str("move_prefix"),
+        }
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("Attach Error: {0}")]
@@ -32,16 +47,24 @@ pub enum Error {
     MissingData,
     #[error("Path Error: {0}")]
     Path(String),
+    #[error("Operation on a poisoned trace handle: {0}")]
+    Poisoned(String),
     #[error("Proof Error: {0}")]
     Proof(String),
+    #[error("Descent hit pruned node: {0}")]
+    PrunedNode(String),
     #[error("Stack Underflow")]
     StackUnderflow,
     #[error("Tree Error: {0}")]
     Tree(String),
+    #[error("Unsupported feature: {0}")]
+    Unsupported(UnsupportedFeature),
     #[error("Unexpected Node Error: {0}")]
     UnexpectedNode(String),
     #[error("Unknown Error")]
     Unknown,
+    #[error("Value omitted from proof: {0}")]
+    ValueOmitted(String),
     #[error("Version Error: {0}")]
     Version(String),
 }

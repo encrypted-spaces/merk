@@ -1,4 +1,4 @@
-use crate::node::Node;
+use crate::avl::node::Node;
 
 /// An entry stored on an `Iter`'s stack, containing a reference to a `Node`,
 /// and its traversal state.

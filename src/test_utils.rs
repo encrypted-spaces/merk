@@ -1,8 +1,9 @@
 #![allow(missing_docs)]
 
-use crate::node::Node;
-use crate::ops::{Batch, BatchEntry, Op, PanicSource};
-use crate::walker::Walker;
+use crate::avl::node::Node;
+use crate::avl::walker::Walker;
+use crate::avl::PanicSource;
+use crate::ops::{Batch, BatchEntry, Op};
 use rand::prelude::*;
 use std::convert::TryInto;
 use std::ops::Range;

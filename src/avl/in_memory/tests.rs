@@ -1,12 +1,13 @@
 use super::*;
+use crate::avl::node::Node;
+#[cfg(not(use_box))]
+use crate::avl::walker::Walker;
+#[cfg(not(use_box))]
+use crate::avl::PanicSource;
 use crate::hash::NULL_HASH;
-use crate::node::Node;
-#[cfg(not(use_box))]
-use crate::ops::PanicSource;
 use crate::proofs::Query;
-#[cfg(not(use_box))]
-use crate::walker::Walker;
-use crate::Op;
+use crate::tracer::WriteOp;
+use crate::{Op, UnsupportedFeature};
 
 fn query_for_keys(keys: &[&[u8]]) -> Query {
     let mut query = Query::new();
@@ -26,7 +27,7 @@ fn test_new_empty() {
 #[test]
 fn test_apply_and_get() {
     let merk = InMemoryMerk::new();
-    merk.apply_batch(&[
+    merk.apply_sorted_batch_ops(&[
         (vec![1], Op::Put(vec![10])),
         (vec![2], Op::Put(vec![20])),
         (vec![3], Op::Put(vec![30])),
@@ -43,10 +44,12 @@ fn test_apply_and_get() {
 #[test]
 fn test_apply_delete() {
     let merk = InMemoryMerk::new();
-    merk.apply_batch(&[(vec![1], Op::Put(vec![10]))]).unwrap();
+    merk.apply_sorted_batch_ops(&[(vec![1], Op::Put(vec![10]))])
+        .unwrap();
     assert!(merk.get(&[1]).is_some());
 
-    merk.apply_batch(&[(vec![1], Op::Delete)]).unwrap();
+    merk.apply_sorted_batch_ops(&[(vec![1], Op::Delete)])
+        .unwrap();
     assert!(merk.get(&[1]).is_none());
     assert_eq!(merk.root_hash(), NULL_HASH);
 }
@@ -56,7 +59,7 @@ fn test_snapshot_isolation() {
     let merk = InMemoryMerk::new();
     merk.put(vec![1], vec![10]).unwrap();
 
-    let snap = merk.snapshot().unwrap();
+    let snap = merk.checkpoint().into_root().unwrap();
     let snap_hash = snap.hash();
 
     merk.put(vec![2], vec![20]).unwrap();
@@ -75,7 +78,7 @@ fn test_prove_and_verify() {
         (b"b".to_vec(), Op::Put(b"val_b".to_vec())),
         (b"c".to_vec(), Op::Put(b"val_c".to_vec())),
     ];
-    merk.apply_batch(&batch).unwrap();
+    merk.apply_sorted_batch_ops(&batch).unwrap();
 
     let keys = [b"b".as_slice(), b"missing".as_slice()];
     let proof_bytes = merk.prove(query_for_keys(&keys)).unwrap();
@@ -90,20 +93,20 @@ fn test_prove_and_verify() {
 #[test]
 fn test_tree_empty() {
     let merk = InMemoryMerk::new();
-    assert!(merk.snapshot().is_none());
+    assert!(merk.checkpoint().is_empty());
 }
 
 #[test]
 fn test_tree_traversable() {
     let merk = InMemoryMerk::new();
-    merk.apply_batch(&[
+    merk.apply_sorted_batch_ops(&[
         (b"a".to_vec(), Op::Put(b"val_a".to_vec())),
         (b"b".to_vec(), Op::Put(b"val_b".to_vec())),
         (b"c".to_vec(), Op::Put(b"val_c".to_vec())),
     ])
     .unwrap();
 
-    let snap = merk.snapshot().unwrap();
+    let snap = merk.checkpoint().into_root().unwrap();
     let tree = snap.clone();
 
     fn collect_keys(node: &Node, keys: &mut Vec<Vec<u8>>) {
@@ -124,20 +127,20 @@ fn test_tree_traversable() {
 #[test]
 fn test_snapshot_empty() {
     let merk = InMemoryMerk::new();
-    assert!(merk.snapshot().is_none());
+    assert!(merk.checkpoint().is_empty());
 }
 
 #[test]
 fn test_with_tree_traversal() {
     let merk = InMemoryMerk::new();
-    merk.apply_batch(&[
+    merk.apply_sorted_batch_ops(&[
         (b"a".to_vec(), Op::Put(b"val_a".to_vec())),
         (b"b".to_vec(), Op::Put(b"val_b".to_vec())),
         (b"c".to_vec(), Op::Put(b"val_c".to_vec())),
     ])
     .unwrap();
 
-    let root = merk.snapshot().unwrap();
+    let root = merk.checkpoint().into_root().unwrap();
     fn collect(node: &Node, keys: &mut Vec<Vec<u8>>) {
         if let Some(left) = node.child(true) {
             collect(left, keys);
@@ -155,7 +158,7 @@ fn test_with_tree_traversal() {
 
 fn make_merk_abcde() -> InMemoryMerk {
     let merk = InMemoryMerk::new();
-    merk.apply_batch(&[
+    merk.apply_sorted_batch_ops(&[
         (b"a".to_vec(), Op::Put(b"val_a".to_vec())),
         (b"b".to_vec(), Op::Put(b"val_b".to_vec())),
         (b"c".to_vec(), Op::Put(b"val_c".to_vec())),
@@ -169,7 +172,7 @@ fn make_merk_abcde() -> InMemoryMerk {
 #[cfg(not(use_box))]
 fn make_merk_abcdefg() -> InMemoryMerk {
     let merk = InMemoryMerk::new();
-    merk.apply_batch(&[
+    merk.apply_sorted_batch_ops(&[
         (b"a".to_vec(), Op::Put(b"1".to_vec())),
         (b"b".to_vec(), Op::Put(b"2".to_vec())),
         (b"c".to_vec(), Op::Put(b"3".to_vec())),
@@ -307,7 +310,7 @@ mod cow_tests {
         use std::sync::Arc as StdArc;
 
         let merk = make_merk_abcdefg();
-        let root = merk.snapshot().unwrap();
+        let root = merk.checkpoint().into_root().unwrap();
         let strong_count_before = StdArc::strong_count(root.inner_arc());
 
         let root_clone = root.clone();
@@ -327,7 +330,7 @@ mod cow_tests {
         use std::sync::Arc as StdArc;
 
         let merk = make_merk_abcdefg();
-        let snapshot_root = merk.snapshot().unwrap();
+        let snapshot_root = merk.checkpoint().into_root().unwrap();
         let before = seven_node_addrs(&snapshot_root);
 
         let cloned_root = snapshot_root.clone();
@@ -358,12 +361,12 @@ mod cow_tests {
     fn test_cow_apply_batch_copies_modified_path_without_live_snapshot() {
         let merk = make_merk_abcdefg();
 
-        let before = seven_node_addrs(&merk.snapshot().unwrap());
+        let before = seven_node_addrs(&merk.checkpoint().into_root().unwrap());
 
-        merk.apply_batch(&[(b"e".to_vec(), Op::Put(b"updated".to_vec()))])
+        merk.apply_sorted_batch_ops(&[(b"e".to_vec(), Op::Put(b"updated".to_vec()))])
             .unwrap();
 
-        let after = seven_node_addrs(&merk.snapshot().unwrap());
+        let after = seven_node_addrs(&merk.checkpoint().into_root().unwrap());
 
         assert_ne!(after.root_d, before.root_d);
         assert_ne!(after.right_f, before.right_f);
@@ -379,27 +382,32 @@ mod cow_tests {
     #[test]
     fn test_cow_read_only_ops_preserve_resident_node_identities() {
         let merk = make_merk_abcdefg();
-        let before = seven_node_addrs(&merk.snapshot().unwrap());
+        let before = seven_node_addrs(&merk.checkpoint().into_root().unwrap());
 
         let _ = merk.get(b"e");
         let _ = merk.root_hash();
-        let _ = collect_iter(&merk.snapshot().unwrap());
-        let _ = merk.snapshot().unwrap().iter_from(b"e").collect::<Vec<_>>();
-        let _ = collect_prefix(&merk.snapshot().unwrap(), b"a");
-        let _ = collect_range(&merk.snapshot().unwrap(), b"b", b"f");
+        let _ = collect_iter(&merk.checkpoint().into_root().unwrap());
+        let _ = merk
+            .checkpoint()
+            .into_root()
+            .unwrap()
+            .iter_from(b"e")
+            .collect::<Vec<_>>();
+        let _ = collect_prefix(&merk.checkpoint().into_root().unwrap(), b"a");
+        let _ = collect_range(&merk.checkpoint().into_root().unwrap(), b"b", b"f");
 
         let mut query = crate::proofs::Query::new();
         query.insert_key(b"e".to_vec());
         let _ = merk.prove(query).unwrap();
 
-        let snap = merk.snapshot().unwrap();
+        let snap = merk.checkpoint().into_root().unwrap();
         let _ = snap.get(b"e");
         let _ = snap.hash();
         let _ = collect_iter(&snap);
 
         let _ = &snap;
 
-        let after = seven_node_addrs(&merk.snapshot().unwrap());
+        let after = seven_node_addrs(&merk.checkpoint().into_root().unwrap());
         assert_eq!(after, before);
     }
 
@@ -408,14 +416,14 @@ mod cow_tests {
         use std::sync::Arc as StdArc;
 
         let merk = InMemoryMerk::new();
-        merk.apply_batch(&[
+        merk.apply_sorted_batch_ops(&[
             (b"a".to_vec(), Op::Put(b"1".to_vec())),
             (b"b".to_vec(), Op::Put(b"2".to_vec())),
             (b"c".to_vec(), Op::Put(b"3".to_vec())),
         ])
         .unwrap();
 
-        let snap = merk.snapshot().unwrap();
+        let snap = merk.checkpoint().into_root().unwrap();
         let root_before = snap.clone();
 
         let mut query = crate::proofs::Query::new();
@@ -434,14 +442,14 @@ mod cow_tests {
         use std::sync::Arc as StdArc;
 
         let merk = InMemoryMerk::new();
-        merk.apply_batch(&[
+        merk.apply_sorted_batch_ops(&[
             (b"a".to_vec(), Op::Put(b"1".to_vec())),
             (b"b".to_vec(), Op::Put(b"2".to_vec())),
             (b"c".to_vec(), Op::Put(b"3".to_vec())),
         ])
         .unwrap();
 
-        let snap = merk.snapshot().unwrap();
+        let snap = merk.checkpoint().into_root().unwrap();
         let root_before = snap.clone();
 
         let mut query = crate::proofs::Query::new();
@@ -460,27 +468,32 @@ mod cow_tests {
         use std::sync::Arc as StdArc;
 
         let merk = InMemoryMerk::new();
-        merk.apply_batch(&[
+        merk.apply_sorted_batch_ops(&[
             (b"a".to_vec(), Op::Put(b"1".to_vec())),
             (b"b".to_vec(), Op::Put(b"2".to_vec())),
             (b"c".to_vec(), Op::Put(b"3".to_vec())),
         ])
         .unwrap();
 
-        let root_before = merk.snapshot().unwrap();
+        let root_before = merk.checkpoint().into_root().unwrap();
 
         let _ = merk.get(b"b");
         let _ = merk.root_hash();
-        let _ = collect_iter(&merk.snapshot().unwrap());
-        let _ = merk.snapshot().unwrap().iter_from(b"b").collect::<Vec<_>>();
-        let _ = collect_prefix(&merk.snapshot().unwrap(), b"a");
-        let _ = collect_range(&merk.snapshot().unwrap(), b"a", b"c");
+        let _ = collect_iter(&merk.checkpoint().into_root().unwrap());
+        let _ = merk
+            .checkpoint()
+            .into_root()
+            .unwrap()
+            .iter_from(b"b")
+            .collect::<Vec<_>>();
+        let _ = collect_prefix(&merk.checkpoint().into_root().unwrap(), b"a");
+        let _ = collect_range(&merk.checkpoint().into_root().unwrap(), b"a", b"c");
 
         let mut query = crate::proofs::Query::new();
         query.insert_key(b"b".to_vec());
         let _ = merk.prove(query).unwrap();
 
-        let root_after = merk.snapshot().unwrap();
+        let root_after = merk.checkpoint().into_root().unwrap();
         assert!(StdArc::ptr_eq(
             root_before.inner_arc(),
             root_after.inner_arc()
@@ -497,9 +510,9 @@ mod cow_tests {
         let initial: Vec<_> = (0u8..31)
             .map(|key| (vec![key], Op::Put(vec![key])))
             .collect();
-        merk.apply_batch(&initial).unwrap();
+        merk.apply_sorted_batch_ops(&initial).unwrap();
 
-        let before_root = merk.snapshot().expect("expected root");
+        let before_root = merk.checkpoint().into_root().expect("expected root");
         let before = collect_node_addrs(&before_root);
 
         let update_keys = [vec![5], vec![25]];
@@ -512,9 +525,9 @@ mod cow_tests {
             (update_keys[0].clone(), Op::Put(b"updated-left".to_vec())),
             (update_keys[1].clone(), Op::Put(b"updated-right".to_vec())),
         ];
-        merk.apply_batch(&batch).unwrap();
+        merk.apply_sorted_batch_ops(&batch).unwrap();
 
-        let after_root = merk.snapshot().expect("expected root");
+        let after_root = merk.checkpoint().into_root().expect("expected root");
         let after = collect_node_addrs(&after_root);
         let copied = changed_node_keys(&before, &after);
 
@@ -547,12 +560,12 @@ mod cow_tests {
             let initial: Vec<_> = (0u8..31)
                 .map(|key| (vec![key], Op::Put(vec![key])))
                 .collect();
-            merk.apply_batch(&initial).unwrap();
+            merk.apply_sorted_batch_ops(&initial).unwrap();
 
             let snapshots: Vec<_> = (0..extra_snapshots)
-                .map(|_| merk.snapshot().unwrap())
+                .map(|_| merk.checkpoint().into_root().unwrap())
                 .collect();
-            let before_root = merk.snapshot().expect("expected root");
+            let before_root = merk.checkpoint().into_root().expect("expected root");
             let expected_copied = path_keys(&before_root, &[21]);
             let before = collect_node_addrs(&before_root);
 
@@ -562,7 +575,7 @@ mod cow_tests {
                 assert_eq!(snap.get(&[21]), Some(vec![21]));
             }
 
-            let after_root = merk.snapshot().expect("expected root");
+            let after_root = merk.checkpoint().into_root().expect("expected root");
             let after = collect_node_addrs(&after_root);
             (changed_node_keys(&before, &after), expected_copied)
         }
@@ -586,14 +599,14 @@ mod cow_tests {
         let n = 10_000;
         let merk = make_large_merk(n);
 
-        let before_root = merk.snapshot().unwrap();
+        let before_root = merk.checkpoint().into_root().unwrap();
         let before = collect_node_addrs(&before_root);
         let update_key = 0u32.to_be_bytes().to_vec();
         let expected_path = path_keys(&before_root, &update_key);
 
         merk.put(update_key, b"updated").unwrap();
 
-        let after_root = merk.snapshot().unwrap();
+        let after_root = merk.checkpoint().into_root().unwrap();
         let after = collect_node_addrs(&after_root);
         let changed = changed_node_keys(&before, &after);
 
@@ -610,7 +623,7 @@ mod cow_tests {
             n,
         );
 
-        crate::test_utils::assert_tree_invariants(&merk.snapshot().unwrap());
+        crate::test_utils::assert_tree_invariants(&merk.checkpoint().into_root().unwrap());
     }
 
     #[test]
@@ -618,7 +631,7 @@ mod cow_tests {
         let n = 10_000;
         let merk = make_large_merk(n);
 
-        let before_root = merk.snapshot().unwrap();
+        let before_root = merk.checkpoint().into_root().unwrap();
         let before = collect_node_addrs(&before_root);
 
         let update_keys: Vec<Vec<u8>> = (0..10)
@@ -633,9 +646,9 @@ mod cow_tests {
             .iter()
             .map(|k| (k.clone(), Op::Put(b"batch-updated".to_vec())))
             .collect();
-        merk.apply_batch(&batch).unwrap();
+        merk.apply_sorted_batch_ops(&batch).unwrap();
 
-        let after_root = merk.snapshot().unwrap();
+        let after_root = merk.checkpoint().into_root().unwrap();
         let after = collect_node_addrs(&after_root);
         let changed = changed_node_keys(&before, &after);
 
@@ -647,7 +660,47 @@ mod cow_tests {
             n,
         );
 
-        crate::test_utils::assert_tree_invariants(&merk.snapshot().unwrap());
+        crate::test_utils::assert_tree_invariants(&merk.checkpoint().into_root().unwrap());
+    }
+
+    #[test]
+    fn cow_large_apply_writes_update_copies_path_union() {
+        let n = 10_000;
+        let merk = make_large_merk(n);
+
+        let before_root = merk.checkpoint().into_root().unwrap();
+        let before = collect_node_addrs(&before_root);
+
+        let update_keys: Vec<Vec<u8>> = (0..10)
+            .map(|i| (i as u32 * (n as u32 / 10)).to_be_bytes().to_vec())
+            .collect();
+        let expected_paths: std::collections::BTreeSet<_> = update_keys
+            .iter()
+            .flat_map(|key| path_keys(&before_root, key))
+            .collect();
+
+        let ops: Vec<_> = update_keys
+            .iter()
+            .map(|key| WriteOp::Put {
+                key: key.clone(),
+                value: b"apply-writes-updated".to_vec(),
+            })
+            .collect();
+        merk.apply_write_ops(&ops).unwrap();
+
+        let after_root = merk.checkpoint().into_root().unwrap();
+        let after = collect_node_addrs(&after_root);
+        let changed = changed_node_keys(&before, &after);
+
+        assert_eq!(changed, expected_paths);
+        assert!(
+            changed.len() < n / 5,
+            "changed {} of {} nodes - expected O(k log n), not O(n)",
+            changed.len(),
+            n,
+        );
+
+        crate::test_utils::assert_tree_invariants(&merk.checkpoint().into_root().unwrap());
     }
 
     #[test]
@@ -655,9 +708,9 @@ mod cow_tests {
         let n = 10_000;
         let merk = make_large_merk(n);
 
-        let before = collect_node_addrs(&merk.snapshot().unwrap());
-        let _snap = merk.snapshot().unwrap();
-        let after = collect_node_addrs(&merk.snapshot().unwrap());
+        let before = collect_node_addrs(&merk.checkpoint().into_root().unwrap());
+        let _snap = merk.checkpoint().into_root().unwrap();
+        let after = collect_node_addrs(&merk.checkpoint().into_root().unwrap());
 
         assert_eq!(
             before, after,
@@ -669,20 +722,21 @@ mod cow_tests {
     fn cow_large_read_ops_preserve_all_pointers() {
         let n = 10_000;
         let merk = make_large_merk(n);
-        let _snap = merk.snapshot().unwrap();
+        let _snap = merk.checkpoint().into_root().unwrap();
 
-        let before = collect_node_addrs(&merk.snapshot().unwrap());
+        let before = collect_node_addrs(&merk.checkpoint().into_root().unwrap());
 
         let _ = merk.get(&(5000u32).to_be_bytes());
         let _ = merk.root_hash();
-        let _ = collect_iter(&merk.snapshot().unwrap());
+        let _ = collect_iter(&merk.checkpoint().into_root().unwrap());
         let _ = merk
-            .snapshot()
+            .checkpoint()
+            .into_root()
             .unwrap()
             .iter_from(&(5000u32).to_be_bytes())
             .collect::<Vec<_>>();
         let _ = collect_range(
-            &merk.snapshot().unwrap(),
+            &merk.checkpoint().into_root().unwrap(),
             &(1000u32).to_be_bytes(),
             &(2000u32).to_be_bytes(),
         );
@@ -691,7 +745,7 @@ mod cow_tests {
         query.insert_key((5000u32).to_be_bytes().to_vec());
         let _ = merk.prove(query).unwrap();
 
-        let after = collect_node_addrs(&merk.snapshot().unwrap());
+        let after = collect_node_addrs(&merk.checkpoint().into_root().unwrap());
         assert_eq!(
             before, after,
             "read ops should not change any node pointers"
@@ -705,10 +759,12 @@ mod cow_tests {
 
         let changed_with_snapshots = |num_snaps: usize| -> std::collections::BTreeSet<Vec<u8>> {
             let merk = make_large_merk(n);
-            let snaps: Vec<_> = (0..num_snaps).map(|_| merk.snapshot().unwrap()).collect();
-            let before = collect_node_addrs(&merk.snapshot().unwrap());
+            let snaps: Vec<_> = (0..num_snaps)
+                .map(|_| merk.checkpoint().into_root().unwrap())
+                .collect();
+            let before = collect_node_addrs(&merk.checkpoint().into_root().unwrap());
             merk.put(update_key.clone(), b"x").unwrap();
-            let after = collect_node_addrs(&merk.snapshot().unwrap());
+            let after = collect_node_addrs(&merk.checkpoint().into_root().unwrap());
             for snap in &snaps {
                 assert_eq!(snap.get(&update_key), Some(vec![0u8; 64]));
             }
@@ -727,10 +783,10 @@ mod cow_tests {
     fn cow_large_scaling_changed_count_grows_logarithmically() {
         fn changed_for_update(n: usize) -> usize {
             let merk = make_large_merk(n);
-            let before = collect_node_addrs(&merk.snapshot().unwrap());
+            let before = collect_node_addrs(&merk.checkpoint().into_root().unwrap());
             let key = 0u32.to_be_bytes().to_vec();
             merk.put(key, b"x").unwrap();
-            let after = collect_node_addrs(&merk.snapshot().unwrap());
+            let after = collect_node_addrs(&merk.checkpoint().into_root().unwrap());
             changed_node_keys(&before, &after).len()
         }
 
@@ -768,7 +824,7 @@ mod cow_tests {
         let mut snapshots = Vec::new();
 
         for round in 0u32..50 {
-            let snap = merk.snapshot().unwrap();
+            let snap = merk.checkpoint().into_root().unwrap();
             let expected_hash = snap.hash();
             let expected_entries: Vec<_> =
                 model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -787,7 +843,7 @@ mod cow_tests {
             }
             let batch: Vec<_> = ops.into_iter().collect();
 
-            merk.apply_batch(&batch).unwrap();
+            merk.apply_sorted_batch_ops(&batch).unwrap();
 
             // Verify old snapshot is still frozen
             assert_eq!(snap.hash(), expected_hash);
@@ -805,15 +861,16 @@ mod cow_tests {
                     Op::Delete => {
                         model.remove(key);
                     }
+                    other => unreachable!("unexpected op in generated batch: {:?}", other),
                 }
             }
 
             // Verify live tree
-            let live_entries = collect_iter(&merk.snapshot().unwrap());
+            let live_entries = collect_iter(&merk.checkpoint().into_root().unwrap());
             let model_entries: Vec<_> = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             assert_eq!(live_entries, model_entries);
 
-            if let Some(root) = merk.snapshot() {
+            if let Some(root) = merk.checkpoint().into_root() {
                 assert_tree_invariants(&root);
             }
         }
@@ -829,7 +886,7 @@ mod cow_tests {
     #[test]
     fn cow_prove_against_old_snapshot_after_rotation_causing_writes() {
         let merk = InMemoryMerk::new();
-        merk.apply_batch(&[
+        merk.apply_sorted_batch_ops(&[
             (b"a".to_vec(), Op::Put(b"1".to_vec())),
             (b"b".to_vec(), Op::Put(b"2".to_vec())),
             (b"c".to_vec(), Op::Put(b"3".to_vec())),
@@ -838,11 +895,11 @@ mod cow_tests {
         ])
         .unwrap();
 
-        let snap = merk.snapshot().unwrap();
+        let snap = merk.checkpoint().into_root().unwrap();
         let snap_hash = snap.hash();
 
         // Heavy mutations that will cause rotations
-        merk.apply_batch(&[
+        merk.apply_sorted_batch_ops(&[
             (b"a".to_vec(), Op::Delete),
             (b"f".to_vec(), Op::Put(b"6".to_vec())),
             (b"g".to_vec(), Op::Put(b"7".to_vec())),
@@ -875,28 +932,28 @@ mod cow_tests {
     #[test]
     fn cow_delete_all_then_reinsert() {
         let merk = InMemoryMerk::new();
-        merk.apply_batch(&[
+        merk.apply_sorted_batch_ops(&[
             (vec![1], Op::Put(vec![10])),
             (vec![2], Op::Put(vec![20])),
             (vec![3], Op::Put(vec![30])),
         ])
         .unwrap();
 
-        let snap = merk.snapshot().unwrap();
+        let snap = merk.checkpoint().into_root().unwrap();
         let snap_hash = snap.hash();
 
         // Delete everything
-        merk.apply_batch(&[
+        merk.apply_sorted_batch_ops(&[
             (vec![1], Op::Delete),
             (vec![2], Op::Delete),
             (vec![3], Op::Delete),
         ])
         .unwrap();
         assert_eq!(merk.root_hash(), NULL_HASH);
-        assert!(merk.snapshot().is_none());
+        assert!(merk.checkpoint().is_empty());
 
         // Reinsert
-        merk.apply_batch(&[(vec![4], Op::Put(vec![40])), (vec![5], Op::Put(vec![50]))])
+        merk.apply_sorted_batch_ops(&[(vec![4], Op::Put(vec![40])), (vec![5], Op::Put(vec![50]))])
             .unwrap();
         assert_ne!(merk.root_hash(), NULL_HASH);
         assert_eq!(merk.get(&[4]), Some(vec![40]));
@@ -908,7 +965,7 @@ mod cow_tests {
         assert_eq!(snap.get(&[1]), Some(vec![10]));
         assert!(snap.get(&[4]).is_none());
 
-        crate::test_utils::assert_tree_invariants(&merk.snapshot().unwrap());
+        crate::test_utils::assert_tree_invariants(&merk.checkpoint().into_root().unwrap());
     }
 
     #[test]
@@ -917,18 +974,18 @@ mod cow_tests {
 
         let merk = InMemoryMerk::new();
         // Build a left-heavy tree
-        merk.apply_batch(&[
+        merk.apply_sorted_batch_ops(&[
             (vec![10], Op::Put(vec![10])),
             (vec![20], Op::Put(vec![20])),
             (vec![30], Op::Put(vec![30])),
         ])
         .unwrap();
 
-        let snap = merk.snapshot().unwrap();
+        let snap = merk.checkpoint().into_root().unwrap();
         let snap_root = snap.clone();
 
         // Force rotations by inserting many keys on one side
-        merk.apply_batch(&[
+        merk.apply_sorted_batch_ops(&[
             (vec![40], Op::Put(vec![40])),
             (vec![50], Op::Put(vec![50])),
             (vec![60], Op::Put(vec![60])),
@@ -947,8 +1004,8 @@ mod cow_tests {
         assert_eq!(snap_entries[2].0, vec![30]);
 
         // Live tree must also be valid with all 8 keys
-        assert_tree_invariants(&merk.snapshot().unwrap());
-        let live_entries = collect_iter(&merk.snapshot().unwrap());
+        assert_tree_invariants(&merk.checkpoint().into_root().unwrap());
+        let live_entries = collect_iter(&merk.checkpoint().into_root().unwrap());
         assert_eq!(live_entries.len(), 8);
     }
 
@@ -957,17 +1014,17 @@ mod cow_tests {
         let merk = InMemoryMerk::new();
         merk.put(vec![1], vec![10]).unwrap();
 
-        let snap1 = merk.snapshot().unwrap();
+        let snap1 = merk.checkpoint().into_root().unwrap();
         let hash1 = snap1.hash();
 
         merk.put(vec![2], vec![20]).unwrap();
 
-        let snap2 = merk.snapshot().unwrap();
+        let snap2 = merk.checkpoint().into_root().unwrap();
         let hash2 = snap2.hash();
 
         merk.put(vec![3], vec![30]).unwrap();
 
-        let snap3 = merk.snapshot().unwrap();
+        let snap3 = merk.checkpoint().into_root().unwrap();
         let hash3 = snap3.hash();
 
         // Each snapshot is frozen at its point in time
@@ -1003,7 +1060,7 @@ mod cow_tests {
         let n = 1_000;
         let merk = make_large_merk(n);
 
-        let snap = merk.snapshot().unwrap();
+        let snap = merk.checkpoint().into_root().unwrap();
         let snap_hash = snap.hash();
 
         // Heavy mutation: delete half, insert new half
@@ -1014,7 +1071,7 @@ mod cow_tests {
             batch.push(((i as u32).to_be_bytes().to_vec(), Op::Put(vec![i as u8])));
         }
         batch.sort_by(|a, b| a.0.cmp(&b.0));
-        merk.apply_batch(&batch).unwrap();
+        merk.apply_sorted_batch_ops(&batch).unwrap();
 
         // Prove against old snapshot for a key that was deleted in the live tree
         let prove_key = (100u32).to_be_bytes().to_vec();
@@ -1027,7 +1084,7 @@ mod cow_tests {
         // That key is gone from the live tree
         assert!(merk.get(&prove_key).is_none());
 
-        if let Some(root) = merk.snapshot() {
+        if let Some(root) = merk.checkpoint().into_root() {
             crate::test_utils::assert_tree_invariants(&root);
         }
     }
@@ -1039,21 +1096,21 @@ mod cow_tests {
         let n = 1_000;
         let merk = make_large_merk(n);
 
-        let snap = merk.snapshot().unwrap();
+        let snap = merk.checkpoint().into_root().unwrap();
         let snap_hash = snap.hash();
 
-        let before = collect_node_addrs(&merk.snapshot().unwrap());
+        let before = collect_node_addrs(&merk.checkpoint().into_root().unwrap());
 
         // Delete 90% of keys
         let batch: Vec<_> = (0..((n * 9) / 10))
             .map(|i| ((i as u32).to_be_bytes().to_vec(), Op::Delete))
             .collect();
-        merk.apply_batch(&batch).unwrap();
+        merk.apply_sorted_batch_ops(&batch).unwrap();
 
-        let remaining = collect_iter(&merk.snapshot().unwrap());
+        let remaining = collect_iter(&merk.checkpoint().into_root().unwrap());
         assert_eq!(remaining.len(), n / 10);
 
-        if let Some(root) = merk.snapshot() {
+        if let Some(root) = merk.checkpoint().into_root() {
             assert_tree_invariants(&root);
             let after = collect_node_addrs(&root);
             let shared = before
@@ -1074,20 +1131,20 @@ mod cow_tests {
     #[test]
     fn cow_snapshot_drop_order_does_not_corrupt() {
         let merk = InMemoryMerk::new();
-        merk.apply_batch(&[
+        merk.apply_sorted_batch_ops(&[
             (vec![1], Op::Put(vec![10])),
             (vec![2], Op::Put(vec![20])),
             (vec![3], Op::Put(vec![30])),
         ])
         .unwrap();
 
-        let snap_a = merk.snapshot().unwrap();
+        let snap_a = merk.checkpoint().into_root().unwrap();
         merk.put(vec![4], vec![40]).unwrap();
 
-        let snap_b = merk.snapshot().unwrap();
+        let snap_b = merk.checkpoint().into_root().unwrap();
         merk.put(vec![5], vec![50]).unwrap();
 
-        let snap_c = merk.snapshot().unwrap();
+        let snap_c = merk.checkpoint().into_root().unwrap();
 
         // One more write after snap_c
         merk.put(vec![6], vec![60]).unwrap();
@@ -1117,7 +1174,7 @@ mod cow_tests {
         drop(snap_b);
         // Live merk still works
         assert_eq!(merk.get(&[1]), Some(vec![10]));
-        crate::test_utils::assert_tree_invariants(&merk.snapshot().unwrap());
+        crate::test_utils::assert_tree_invariants(&merk.checkpoint().into_root().unwrap());
     }
 }
 
@@ -1146,6 +1203,15 @@ fn apply_batch_to_model(model: &mut std::collections::BTreeMap<Vec<u8>, Vec<u8>>
             }
             Op::Delete => {
                 model.remove(key);
+            }
+            Op::DeleteRange(end) => {
+                let keys_to_remove: Vec<Vec<u8>> = model
+                    .range(key.clone()..end.clone())
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for k in keys_to_remove {
+                    model.remove(&k);
+                }
             }
         }
     }
@@ -1193,23 +1259,23 @@ fn path_keys(root: &Node, key: &[u8]) -> std::collections::BTreeSet<Vec<u8>> {
 #[test]
 fn test_iter_empty() {
     let merk = InMemoryMerk::new();
-    assert!(merk.snapshot().is_none());
+    assert!(merk.checkpoint().is_empty());
 }
 
 #[test]
 fn test_iter_single() {
     let merk = InMemoryMerk::new();
     merk.put(b"x", b"v").unwrap();
-    let fwd = collect_iter(&merk.snapshot().unwrap());
+    let fwd = collect_iter(&merk.checkpoint().into_root().unwrap());
     assert_eq!(keys(&fwd), vec![b"x".as_slice()]);
-    let rev = collect_reverse_iter(&merk.snapshot().unwrap());
+    let rev = collect_reverse_iter(&merk.checkpoint().into_root().unwrap());
     assert_eq!(keys(&rev), vec![b"x".as_slice()]);
 }
 
 #[test]
 fn test_iter_forward() {
     let merk = make_merk_abcde();
-    let entries = collect_iter(&merk.snapshot().unwrap());
+    let entries = collect_iter(&merk.checkpoint().into_root().unwrap());
     assert_eq!(
         keys(&entries),
         vec![
@@ -1225,7 +1291,7 @@ fn test_iter_forward() {
 #[test]
 fn test_iter_reverse() {
     let merk = make_merk_abcde();
-    let entries = collect_reverse_iter(&merk.snapshot().unwrap());
+    let entries = collect_reverse_iter(&merk.checkpoint().into_root().unwrap());
     assert_eq!(
         keys(&entries),
         vec![
@@ -1243,13 +1309,18 @@ fn test_iter_reverse() {
 #[test]
 fn test_iter_from_empty() {
     let merk = InMemoryMerk::new();
-    assert!(merk.snapshot().is_none());
+    assert!(merk.checkpoint().is_empty());
 }
 
 #[test]
 fn test_iter_from_forward_existing() {
     let merk = make_merk_abcde();
-    let entries = merk.snapshot().unwrap().iter_from(b"c").collect::<Vec<_>>();
+    let entries = merk
+        .checkpoint()
+        .into_root()
+        .unwrap()
+        .iter_from(b"c")
+        .collect::<Vec<_>>();
     assert_eq!(
         keys(&entries),
         vec![b"c".as_slice(), b"d".as_slice(), b"e".as_slice()]
@@ -1260,7 +1331,8 @@ fn test_iter_from_forward_existing() {
 fn test_iter_from_forward_missing_lower_bound() {
     let merk = make_merk_abcde();
     let entries = merk
-        .snapshot()
+        .checkpoint()
+        .into_root()
         .unwrap()
         .iter_from(b"bb")
         .collect::<Vec<_>>();
@@ -1273,7 +1345,12 @@ fn test_iter_from_forward_missing_lower_bound() {
 #[test]
 fn test_iter_from_forward_past_end() {
     let merk = make_merk_abcde();
-    let entries = merk.snapshot().unwrap().iter_from(b"z").collect::<Vec<_>>();
+    let entries = merk
+        .checkpoint()
+        .into_root()
+        .unwrap()
+        .iter_from(b"z")
+        .collect::<Vec<_>>();
     assert!(entries.is_empty());
 }
 
@@ -1281,7 +1358,8 @@ fn test_iter_from_forward_past_end() {
 fn test_iter_from_reverse_existing() {
     let merk = make_merk_abcde();
     let entries = merk
-        .snapshot()
+        .checkpoint()
+        .into_root()
         .unwrap()
         .reverse_iter_from(b"c")
         .collect::<Vec<_>>();
@@ -1295,7 +1373,8 @@ fn test_iter_from_reverse_existing() {
 fn test_iter_from_reverse_missing_lower_bound() {
     let merk = make_merk_abcde();
     let entries = merk
-        .snapshot()
+        .checkpoint()
+        .into_root()
         .unwrap()
         .reverse_iter_from(b"bb")
         .collect::<Vec<_>>();
@@ -1306,7 +1385,8 @@ fn test_iter_from_reverse_missing_lower_bound() {
 fn test_iter_from_reverse_before_start() {
     let merk = make_merk_abcde();
     let entries = merk
-        .snapshot()
+        .checkpoint()
+        .into_root()
         .unwrap()
         .reverse_iter_from(b"\x00")
         .collect::<Vec<_>>();
@@ -1318,13 +1398,13 @@ fn test_iter_from_reverse_before_start() {
 #[test]
 fn test_iter_prefix_empty_tree() {
     let merk = InMemoryMerk::new();
-    assert!(merk.snapshot().is_none());
+    assert!(merk.checkpoint().is_empty());
 }
 
 #[test]
 fn test_iter_prefix_matching() {
     let merk = InMemoryMerk::new();
-    merk.apply_batch(&[
+    merk.apply_sorted_batch_ops(&[
         (b"px_1".to_vec(), Op::Put(b"v1".to_vec())),
         (b"px_2".to_vec(), Op::Put(b"v2".to_vec())),
         (b"px_3".to_vec(), Op::Put(b"v3".to_vec())),
@@ -1332,13 +1412,13 @@ fn test_iter_prefix_matching() {
     ])
     .unwrap();
 
-    let fwd = collect_prefix(&merk.snapshot().unwrap(), b"px");
+    let fwd = collect_prefix(&merk.checkpoint().into_root().unwrap(), b"px");
     assert_eq!(
         keys(&fwd),
         vec![b"px_1".as_slice(), b"px_2".as_slice(), b"px_3".as_slice()]
     );
 
-    let rev = collect_prefix_reverse(&merk.snapshot().unwrap(), b"px");
+    let rev = collect_prefix_reverse(&merk.checkpoint().into_root().unwrap(), b"px");
     assert_eq!(
         keys(&rev),
         vec![b"px_3".as_slice(), b"px_2".as_slice(), b"px_1".as_slice()]
@@ -1348,13 +1428,13 @@ fn test_iter_prefix_matching() {
 #[test]
 fn test_iter_prefix_missing() {
     let merk = make_merk_abcde();
-    assert!(collect_prefix(&merk.snapshot().unwrap(), b"z").is_empty());
+    assert!(collect_prefix(&merk.checkpoint().into_root().unwrap(), b"z").is_empty());
 }
 
 #[test]
 fn test_iter_prefix_empty_prefix_matches_all() {
     let merk = make_merk_abcde();
-    let entries = collect_prefix(&merk.snapshot().unwrap(), b"");
+    let entries = collect_prefix(&merk.checkpoint().into_root().unwrap(), b"");
     assert_eq!(entries.len(), 5);
 }
 
@@ -1363,20 +1443,20 @@ fn test_iter_prefix_empty_prefix_matches_all() {
 #[test]
 fn test_iter_range_empty_tree() {
     let merk = InMemoryMerk::new();
-    assert!(merk.snapshot().is_none());
+    assert!(merk.checkpoint().is_empty());
 }
 
 #[test]
 fn test_iter_range_forward() {
     let merk = make_merk_abcde();
-    let entries = collect_range(&merk.snapshot().unwrap(), b"b", b"d");
+    let entries = collect_range(&merk.checkpoint().into_root().unwrap(), b"b", b"d");
     assert_eq!(keys(&entries), vec![b"b".as_slice(), b"c".as_slice()]);
 }
 
 #[test]
 fn test_iter_range_reverse() {
     let merk = make_merk_abcde();
-    let entries = collect_range_reverse(&merk.snapshot().unwrap(), b"b", b"e");
+    let entries = collect_range_reverse(&merk.checkpoint().into_root().unwrap(), b"b", b"e");
     assert_eq!(
         keys(&entries),
         vec![b"d".as_slice(), b"c".as_slice(), b"b".as_slice()]
@@ -1386,24 +1466,24 @@ fn test_iter_range_reverse() {
 #[test]
 fn test_iter_range_half_open_boundary() {
     let merk = make_merk_abcde();
-    let entries = collect_range(&merk.snapshot().unwrap(), b"a", b"f");
+    let entries = collect_range(&merk.checkpoint().into_root().unwrap(), b"a", b"f");
     assert_eq!(entries.len(), 5);
 
-    let entries = collect_range(&merk.snapshot().unwrap(), b"c", b"c");
+    let entries = collect_range(&merk.checkpoint().into_root().unwrap(), b"c", b"c");
     assert!(entries.is_empty());
 }
 
 #[test]
 fn test_iter_range_missing_bounds() {
     let merk = make_merk_abcde();
-    let entries = collect_range(&merk.snapshot().unwrap(), b"aa", b"cc");
+    let entries = collect_range(&merk.checkpoint().into_root().unwrap(), b"aa", b"cc");
     assert_eq!(keys(&entries), vec![b"b".as_slice(), b"c".as_slice()]);
 }
 
 #[test]
 fn test_iter_range_inverted_returns_empty() {
     let merk = make_merk_abcde();
-    let snap = merk.snapshot().unwrap();
+    let snap = merk.checkpoint().into_root().unwrap();
     assert!(collect_range(&snap, b"z", b"a").is_empty());
     assert!(collect_range_reverse(&snap, b"z", b"a").is_empty());
 }
@@ -1413,7 +1493,7 @@ fn test_iter_range_inverted_returns_empty() {
 #[test]
 fn test_snapshot_iter() {
     let merk = make_merk_abcde();
-    let snap = merk.snapshot().unwrap();
+    let snap = merk.checkpoint().into_root().unwrap();
     let entries = collect_iter(&snap);
     assert_eq!(entries.len(), 5);
     assert_eq!(entries[0].0, b"a");
@@ -1423,7 +1503,7 @@ fn test_snapshot_iter() {
 #[test]
 fn test_snapshot_iter_from() {
     let merk = make_merk_abcde();
-    let snap = merk.snapshot().unwrap();
+    let snap = merk.checkpoint().into_root().unwrap();
     let entries = snap.iter_from(b"c").collect::<Vec<_>>();
     assert_eq!(
         keys(&entries),
@@ -1434,13 +1514,13 @@ fn test_snapshot_iter_from() {
 #[test]
 fn test_snapshot_iter_prefix() {
     let merk = InMemoryMerk::new();
-    merk.apply_batch(&[
+    merk.apply_sorted_batch_ops(&[
         (b"px_1".to_vec(), Op::Put(b"v1".to_vec())),
         (b"px_2".to_vec(), Op::Put(b"v2".to_vec())),
         (b"qx_1".to_vec(), Op::Put(b"v3".to_vec())),
     ])
     .unwrap();
-    let snap = merk.snapshot().unwrap();
+    let snap = merk.checkpoint().into_root().unwrap();
     let entries = collect_prefix(&snap, b"px");
     assert_eq!(keys(&entries), vec![b"px_1".as_slice(), b"px_2".as_slice()]);
 }
@@ -1448,7 +1528,7 @@ fn test_snapshot_iter_prefix() {
 #[test]
 fn test_snapshot_iter_range() {
     let merk = make_merk_abcde();
-    let snap = merk.snapshot().unwrap();
+    let snap = merk.checkpoint().into_root().unwrap();
     let entries = collect_range_reverse(&snap, b"b", b"d");
     assert_eq!(keys(&entries), vec![b"c".as_slice(), b"b".as_slice()]);
 }
@@ -1456,12 +1536,12 @@ fn test_snapshot_iter_range() {
 #[test]
 fn test_snapshot_with_tree() {
     let merk = InMemoryMerk::new();
-    merk.apply_batch(&[
+    merk.apply_sorted_batch_ops(&[
         (b"a".to_vec(), Op::Put(b"val_a".to_vec())),
         (b"b".to_vec(), Op::Put(b"val_b".to_vec())),
     ])
     .unwrap();
-    let snap = merk.snapshot().unwrap();
+    let snap = merk.checkpoint().into_root().unwrap();
     let root_key = Some(snap.key().to_vec());
     assert!(root_key.is_some());
 }
@@ -1469,7 +1549,7 @@ fn test_snapshot_with_tree() {
 #[test]
 fn test_snapshot_with_tree_empty() {
     let merk = InMemoryMerk::new();
-    assert!(merk.snapshot().is_none());
+    assert!(merk.checkpoint().is_empty());
 }
 
 // --- snapshot isolation for scan helpers ---
@@ -1477,20 +1557,20 @@ fn test_snapshot_with_tree_empty() {
 #[test]
 fn test_snapshot_scan_isolation() {
     let merk = InMemoryMerk::new();
-    merk.apply_batch(&[
+    merk.apply_sorted_batch_ops(&[
         (b"a".to_vec(), Op::Put(b"v1".to_vec())),
         (b"b".to_vec(), Op::Put(b"v2".to_vec())),
     ])
     .unwrap();
 
-    let snap = merk.snapshot().unwrap();
+    let snap = merk.checkpoint().into_root().unwrap();
 
     merk.put(b"c", b"v3").unwrap();
 
     let snap_entries = collect_iter(&snap);
     assert_eq!(snap_entries.len(), 2);
 
-    let merk_entries = collect_iter(&merk.snapshot().unwrap());
+    let merk_entries = collect_iter(&merk.checkpoint().into_root().unwrap());
     assert_eq!(merk_entries.len(), 3);
 }
 
@@ -1503,7 +1583,8 @@ fn test_apply_failure_leaves_root_unchanged() {
     let hash_before = merk.root_hash();
 
     // Unsorted batch should fail validation without modifying the tree
-    let result = merk.apply_batch(&[(vec![5], Op::Put(vec![50])), (vec![2], Op::Put(vec![20]))]);
+    let result =
+        merk.apply_sorted_batch_ops(&[(vec![5], Op::Put(vec![50])), (vec![2], Op::Put(vec![20]))]);
     assert!(result.is_err());
 
     assert_eq!(merk.root_hash(), hash_before);
@@ -1521,7 +1602,7 @@ fn snapshot_stress_random_batches_keep_old_versions_stable() {
     let initial: Vec<_> = (0u8..64)
         .map(|key| (vec![key], Op::Put(vec![key, key.wrapping_mul(3)])))
         .collect();
-    merk.apply_batch(&initial).unwrap();
+    merk.apply_sorted_batch_ops(&initial).unwrap();
 
     let mut model = BTreeMap::new();
     apply_batch_to_model(&mut model, &initial);
@@ -1530,7 +1611,7 @@ fn snapshot_stress_random_batches_keep_old_versions_stable() {
     let mut snapshots = Vec::new();
 
     for round in 0u8..32 {
-        let snap = merk.snapshot().unwrap();
+        let snap = merk.checkpoint().into_root().unwrap();
         let expected_hash = snap.hash();
         let expected_entries = model_entries(&model);
 
@@ -1546,17 +1627,17 @@ fn snapshot_stress_random_batches_keep_old_versions_stable() {
         }
         let batch: Vec<_> = ops.into_iter().collect();
 
-        merk.apply_batch(&batch).unwrap();
+        merk.apply_sorted_batch_ops(&batch).unwrap();
 
         assert_snapshot_still_matches(&snap, expected_hash, &expected_entries);
         snapshots.push((snap, expected_hash, expected_entries));
 
         apply_batch_to_model(&mut model, &batch);
         assert_eq!(
-            collect_iter(&merk.snapshot().unwrap()),
+            collect_iter(&merk.checkpoint().into_root().unwrap()),
             model_entries(&model)
         );
-        if let Some(root) = merk.snapshot() {
+        if let Some(root) = merk.checkpoint().into_root() {
             assert_tree_invariants(&root);
         }
     }
@@ -1576,7 +1657,7 @@ fn make_large_merk(n: usize) -> InMemoryMerk {
             (key, Op::Put(value))
         })
         .collect();
-    merk.apply_batch(&batch).unwrap();
+    merk.apply_sorted_batch_ops(&batch).unwrap();
     merk
 }
 
@@ -1584,7 +1665,7 @@ fn make_large_merk(n: usize) -> InMemoryMerk {
 fn apply_batch_rejects_unsorted_batch() {
     let merk = InMemoryMerk::new();
     let batch = vec![(vec![2], Op::Put(vec![20])), (vec![1], Op::Put(vec![10]))];
-    let err = merk.apply_batch(&batch).unwrap_err();
+    let err = merk.apply_sorted_batch_ops(&batch).unwrap_err();
     assert!(err.to_string().contains("sorted"));
 }
 
@@ -1592,14 +1673,14 @@ fn apply_batch_rejects_unsorted_batch() {
 fn apply_batch_rejects_duplicate_keys() {
     let merk = InMemoryMerk::new();
     let batch = vec![(vec![1], Op::Put(vec![10])), (vec![1], Op::Put(vec![20]))];
-    let err = merk.apply_batch(&batch).unwrap_err();
+    let err = merk.apply_sorted_batch_ops(&batch).unwrap_err();
     assert!(err.to_string().contains("unique"));
 }
 
 #[test]
 fn apply_batch_accepts_empty_batch() {
     let merk = InMemoryMerk::new();
-    merk.apply_batch(&[]).unwrap();
+    merk.apply_sorted_batch_ops(&[]).unwrap();
     assert_eq!(merk.root_hash(), NULL_HASH);
 }
 
@@ -1607,7 +1688,7 @@ fn apply_batch_accepts_empty_batch() {
 fn apply_batch_accepts_single_element() {
     let merk = InMemoryMerk::new();
     let batch = vec![(vec![1], Op::Put(vec![10]))];
-    merk.apply_batch(&batch).unwrap();
+    merk.apply_sorted_batch_ops(&batch).unwrap();
     assert_eq!(merk.get(&[1]), Some(vec![10]));
 }
 
@@ -1615,7 +1696,7 @@ fn apply_batch_accepts_single_element() {
 fn apply_batch_owned_applies_batch() {
     let merk = InMemoryMerk::new();
 
-    merk.apply_batch_owned(vec![
+    merk.apply_sorted_batch_ops_owned(vec![
         (vec![1], Op::Put(vec![10])),
         (vec![2], Op::Put(vec![20])),
     ])
@@ -1629,7 +1710,7 @@ fn apply_batch_owned_applies_batch() {
 fn apply_batch_owned_rejects_unsorted_batch() {
     let merk = InMemoryMerk::new();
     let err = merk
-        .apply_batch_owned(vec![
+        .apply_sorted_batch_ops_owned(vec![
             (vec![2], Op::Put(vec![20])),
             (vec![1], Op::Put(vec![10])),
         ])
@@ -1702,4 +1783,712 @@ fn put_accepts_various_types() {
     assert_eq!(merk.get(&[1, 2, 3]), Some(vec![4, 5, 6]));
     assert_eq!(merk.get(&[7, 8]), Some(vec![9, 10]));
     assert_eq!(merk.get(b"hello"), Some(b"world".to_vec()));
+}
+
+// InMemoryMerk DeleteRange tests
+
+#[test]
+fn delete_range_basic() {
+    let merk = InMemoryMerk::new();
+    let batch: Vec<_> = (0u8..10)
+        .map(|i| (vec![i], Op::Put(vec![i * 10])))
+        .collect();
+    merk.apply_sorted_batch_ops(&batch).unwrap();
+
+    merk.delete_range([3], [7]).unwrap();
+
+    assert_eq!(merk.get(&[2]), Some(vec![20]));
+    assert_eq!(merk.get(&[3]), None);
+    assert_eq!(merk.get(&[6]), None);
+    assert_eq!(merk.get(&[7]), Some(vec![70]));
+}
+
+#[test]
+fn delete_range_empty_tree() {
+    let merk = InMemoryMerk::new();
+    merk.delete_range([0], [10]).unwrap();
+    assert_eq!(merk.root_hash(), NULL_HASH);
+}
+
+#[test]
+fn delete_range_all_keys() {
+    let merk = InMemoryMerk::new();
+    let batch: Vec<_> = (1u8..5).map(|i| (vec![i], Op::Put(vec![i]))).collect();
+    merk.apply_sorted_batch_ops(&batch).unwrap();
+    assert_ne!(merk.root_hash(), NULL_HASH);
+
+    merk.delete_range([0], [10]).unwrap();
+    assert_eq!(merk.root_hash(), NULL_HASH);
+}
+
+#[test]
+fn delete_range_rejects_invalid_bounds() {
+    let merk = InMemoryMerk::new();
+    let batch = vec![(vec![5], Op::Put(vec![50]))];
+    merk.apply_sorted_batch_ops(&batch).unwrap();
+
+    assert!(merk.delete_range([5], [5]).is_err());
+    assert!(merk.delete_range([8], [3]).is_err());
+}
+
+#[test]
+fn delete_range_commits_and_updates_hash() {
+    let merk = InMemoryMerk::new();
+    let batch: Vec<_> = (0u8..20).map(|i| (vec![i], Op::Put(vec![i]))).collect();
+    merk.apply_sorted_batch_ops(&batch).unwrap();
+    let hash_before = merk.root_hash();
+
+    merk.delete_range([5], [15]).unwrap();
+    let hash_after = merk.root_hash();
+
+    assert_ne!(hash_before, hash_after);
+    assert_ne!(hash_after, NULL_HASH);
+}
+
+#[test]
+fn delete_range_preserves_existing_snapshot() {
+    let merk = InMemoryMerk::new();
+    let batch: Vec<_> = (0u8..20).map(|i| (vec![i], Op::Put(vec![i]))).collect();
+    merk.apply_sorted_batch_ops(&batch).unwrap();
+
+    let snap = merk.checkpoint().into_root().unwrap();
+    let expected_hash = snap.hash();
+    let expected_entries = collect_iter(&snap);
+
+    merk.delete_range([5], [15]).unwrap();
+
+    assert_snapshot_still_matches(&snap, expected_hash, &expected_entries);
+    assert_eq!(merk.get(&[4]), Some(vec![4]));
+    for i in 5u8..15 {
+        assert_eq!(merk.get(&[i]), None);
+    }
+    assert_eq!(merk.get(&[15]), Some(vec![15]));
+    crate::test_utils::assert_tree_invariants(&merk.checkpoint().into_root().unwrap());
+}
+
+// Mixed batch (point ops + DeleteRange) tests
+
+#[test]
+fn apply_batch_puts_and_deletes_mixed() {
+    let merk = InMemoryMerk::new();
+    merk.apply_sorted_batch_ops(&[
+        (vec![1], Op::Put(vec![10])),
+        (vec![3], Op::Put(vec![30])),
+        (vec![5], Op::Put(vec![50])),
+    ])
+    .unwrap();
+    assert_eq!(merk.get(&[1]), Some(vec![10]));
+    assert_eq!(merk.get(&[3]), Some(vec![30]));
+    assert_eq!(merk.get(&[5]), Some(vec![50]));
+
+    merk.apply_sorted_batch_ops(&[(vec![3], Op::Delete)])
+        .unwrap();
+    assert_eq!(merk.get(&[3]), None);
+}
+
+#[test]
+fn apply_batch_with_delete_range() {
+    let merk = InMemoryMerk::new();
+    let batch: Vec<_> = (0u8..20)
+        .map(|i| (vec![i], Op::Put(vec![i * 10])))
+        .collect();
+    merk.apply_sorted_batch_ops(&batch).unwrap();
+
+    // Mixed batch: point op, then DeleteRange, then point op
+    let mixed_batch = vec![
+        (vec![0], Op::Put(vec![99])),
+        (vec![5], Op::DeleteRange(vec![15])),
+        (vec![19], Op::Put(vec![88])),
+    ];
+    merk.apply_sorted_batch_ops(&mixed_batch).unwrap();
+
+    assert_eq!(merk.get(&[0]), Some(vec![99]));
+    assert_eq!(merk.get(&[4]), Some(vec![40]));
+    assert_eq!(merk.get(&[5]), None);
+    assert_eq!(merk.get(&[14]), None);
+    assert_eq!(merk.get(&[15]), Some(vec![150]));
+    assert_eq!(merk.get(&[19]), Some(vec![88]));
+}
+
+#[test]
+fn apply_batch_owned_with_delete_range() {
+    let merk = InMemoryMerk::new();
+    let batch: Vec<_> = (0u8..20)
+        .map(|i| (vec![i], Op::Put(vec![i * 10])))
+        .collect();
+    merk.apply_sorted_batch_ops(&batch).unwrap();
+
+    let mixed_batch = vec![
+        (vec![5], Op::DeleteRange(vec![10])),
+        (vec![5], Op::Put(vec![55])),
+        (vec![8], Op::Put(vec![88])),
+        (vec![12], Op::Put(vec![120])),
+    ];
+    merk.apply_sorted_batch_ops_owned(mixed_batch).unwrap();
+
+    assert_eq!(merk.get(&[4]), Some(vec![40]));
+    assert_eq!(merk.get(&[5]), Some(vec![55]));
+    assert_eq!(merk.get(&[6]), None);
+    assert_eq!(merk.get(&[8]), Some(vec![88]));
+    assert_eq!(merk.get(&[9]), None);
+    assert_eq!(merk.get(&[10]), Some(vec![100]));
+    assert_eq!(merk.get(&[12]), Some(vec![120]));
+}
+
+#[test]
+fn apply_batch_empty_is_noop() {
+    let merk = InMemoryMerk::new();
+    let batch = vec![(vec![1], Op::Put(vec![10]))];
+    merk.apply_sorted_batch_ops(&batch).unwrap();
+    let hash_before = merk.root_hash();
+
+    merk.apply_sorted_batch_ops(&[]).unwrap();
+    assert_eq!(merk.root_hash(), hash_before);
+}
+
+#[test]
+fn apply_batch_rejects_unsorted_mixed() {
+    let merk = InMemoryMerk::new();
+    let batch = vec![(vec![5], Op::Put(vec![50])), (vec![1], Op::Put(vec![10]))];
+    assert!(merk.apply_sorted_batch_ops(&batch).is_err());
+}
+
+#[test]
+fn apply_batch_delete_range_rejects_invalid_bounds() {
+    let merk = InMemoryMerk::new();
+    // start >= end should fail
+    let batch = vec![(vec![5], Op::DeleteRange(vec![3]))];
+    assert!(merk.apply_sorted_batch_ops(&batch).is_err());
+
+    let batch = vec![(vec![5], Op::DeleteRange(vec![5]))];
+    assert!(merk.apply_sorted_batch_ops(&batch).is_err());
+}
+
+#[test]
+fn apply_batch_allows_point_op_after_delete_range_at_same_key() {
+    // A DeleteRange followed by a Put at the same start key is valid
+    // (they are in different segments)
+    let merk = InMemoryMerk::new();
+    let batch: Vec<_> = (0u8..10)
+        .map(|i| (vec![i], Op::Put(vec![i * 10])))
+        .collect();
+    merk.apply_sorted_batch_ops(&batch).unwrap();
+
+    // Delete [3, 7) then re-insert key 3 in the same batch
+    let mixed = vec![
+        (vec![3], Op::DeleteRange(vec![7])),
+        (vec![3], Op::Put(vec![33])),
+    ];
+    merk.apply_sorted_batch_ops(&mixed).unwrap();
+    assert_eq!(merk.get(&[3]), Some(vec![33]));
+    assert_eq!(merk.get(&[6]), None);
+    assert_eq!(merk.get(&[7]), Some(vec![70]));
+}
+
+#[test]
+fn apply_batch_allows_delete_after_delete_range_at_same_key() {
+    let merk = InMemoryMerk::new();
+    let batch: Vec<_> = (0u8..10)
+        .map(|i| (vec![i], Op::Put(vec![i * 10])))
+        .collect();
+    merk.apply_sorted_batch_ops(&batch).unwrap();
+
+    let mixed = vec![(vec![3], Op::DeleteRange(vec![7])), (vec![3], Op::Delete)];
+    merk.apply_sorted_batch_ops(&mixed).unwrap();
+
+    assert_eq!(merk.get(&[2]), Some(vec![20]));
+    assert_eq!(merk.get(&[3]), None);
+    assert_eq!(merk.get(&[6]), None);
+    assert_eq!(merk.get(&[7]), Some(vec![70]));
+}
+
+#[test]
+fn apply_batch_rejects_delete_range_after_delete_range_at_same_key() {
+    let merk = InMemoryMerk::new();
+    let batch = vec![
+        (vec![5], Op::DeleteRange(vec![10])),
+        (vec![5], Op::DeleteRange(vec![15])),
+    ];
+
+    assert!(merk.apply_sorted_batch_ops(&batch).is_err());
+    assert_eq!(merk.root_hash(), NULL_HASH);
+}
+
+// DeleteRange + insert/update edge cases
+
+#[test]
+fn delete_range_then_insert_within_range() {
+    // Delete [5, 15) then insert keys inside that range in the same batch
+    let merk = InMemoryMerk::new();
+    let batch: Vec<_> = (0u8..20)
+        .map(|i| (vec![i], Op::Put(vec![i * 10])))
+        .collect();
+    merk.apply_sorted_batch_ops(&batch).unwrap();
+
+    let mixed = vec![
+        (vec![5], Op::DeleteRange(vec![15])),
+        (vec![7], Op::Put(vec![77])),
+        (vec![10], Op::Put(vec![100])),
+        (vec![12], Op::Put(vec![120])),
+    ];
+    merk.apply_sorted_batch_ops(&mixed).unwrap();
+
+    // Keys in [5,15) that were NOT re-inserted should be gone
+    assert_eq!(merk.get(&[5]), None);
+    assert_eq!(merk.get(&[6]), None);
+    assert_eq!(merk.get(&[8]), None);
+    assert_eq!(merk.get(&[9]), None);
+    assert_eq!(merk.get(&[11]), None);
+    assert_eq!(merk.get(&[13]), None);
+    assert_eq!(merk.get(&[14]), None);
+
+    // Re-inserted keys should have new values
+    assert_eq!(merk.get(&[7]), Some(vec![77]));
+    assert_eq!(merk.get(&[10]), Some(vec![100]));
+    assert_eq!(merk.get(&[12]), Some(vec![120]));
+
+    // Keys outside the range should be untouched
+    assert_eq!(merk.get(&[4]), Some(vec![40]));
+    assert_eq!(merk.get(&[15]), Some(vec![150]));
+}
+
+#[test]
+fn delete_range_then_insert_at_start_boundary() {
+    // Delete [5, 15) then re-insert exactly at key 5 (the start boundary)
+    let merk = InMemoryMerk::new();
+    let batch: Vec<_> = (0u8..20)
+        .map(|i| (vec![i], Op::Put(vec![i * 10])))
+        .collect();
+    merk.apply_sorted_batch_ops(&batch).unwrap();
+
+    let mixed = vec![
+        (vec![5], Op::DeleteRange(vec![15])),
+        (vec![5], Op::Put(vec![55])),
+    ];
+    merk.apply_sorted_batch_ops(&mixed).unwrap();
+
+    // Key 5 was deleted then re-inserted with new value
+    assert_eq!(merk.get(&[5]), Some(vec![55]));
+    assert_eq!(merk.get(&[6]), None);
+    assert_eq!(merk.get(&[14]), None);
+    assert_eq!(merk.get(&[15]), Some(vec![150]));
+}
+
+#[test]
+fn delete_range_then_insert_at_end_boundary() {
+    // Delete [5, 15) - key 15 is NOT deleted (exclusive end)
+    // Then update key 15 in the same batch
+    let merk = InMemoryMerk::new();
+    let batch: Vec<_> = (0u8..20)
+        .map(|i| (vec![i], Op::Put(vec![i * 10])))
+        .collect();
+    merk.apply_sorted_batch_ops(&batch).unwrap();
+
+    let mixed = vec![
+        (vec![5], Op::DeleteRange(vec![15])),
+        (vec![15], Op::Put(vec![155])),
+    ];
+    merk.apply_sorted_batch_ops(&mixed).unwrap();
+
+    assert_eq!(merk.get(&[14]), None);
+    assert_eq!(merk.get(&[15]), Some(vec![155])); // updated, not deleted
+    assert_eq!(merk.get(&[16]), Some(vec![160])); // untouched
+}
+
+#[test]
+fn delete_range_then_insert_just_before_end() {
+    // Delete [5, 15) then insert at key 14 (last key that was deleted)
+    let merk = InMemoryMerk::new();
+    let batch: Vec<_> = (0u8..20)
+        .map(|i| (vec![i], Op::Put(vec![i * 10])))
+        .collect();
+    merk.apply_sorted_batch_ops(&batch).unwrap();
+
+    let mixed = vec![
+        (vec![5], Op::DeleteRange(vec![15])),
+        (vec![14], Op::Put(vec![140])),
+    ];
+    merk.apply_sorted_batch_ops(&mixed).unwrap();
+
+    assert_eq!(merk.get(&[13]), None);
+    assert_eq!(merk.get(&[14]), Some(vec![140]));
+    assert_eq!(merk.get(&[15]), Some(vec![150]));
+}
+
+#[test]
+fn delete_range_insert_new_key_within_range() {
+    // Delete [5, 15) then insert a key that never existed before
+    let merk = InMemoryMerk::new();
+    // Only insert even keys
+    let batch: Vec<_> = (0u8..10)
+        .map(|i| (vec![i * 2], Op::Put(vec![i * 20])))
+        .collect();
+    merk.apply_sorted_batch_ops(&batch).unwrap();
+
+    // Delete [3, 13) - removes keys 4, 6, 8, 10, 12
+    // Then insert key 7 which never existed
+    let mixed = vec![
+        (vec![3], Op::DeleteRange(vec![13])),
+        (vec![7], Op::Put(vec![77])),
+    ];
+    merk.apply_sorted_batch_ops(&mixed).unwrap();
+
+    assert_eq!(merk.get(&[4]), None);
+    assert_eq!(merk.get(&[6]), None);
+    assert_eq!(merk.get(&[7]), Some(vec![77])); // new key
+    assert_eq!(merk.get(&[8]), None);
+    assert_eq!(merk.get(&[14]), Some(vec![140])); // outside range
+}
+
+#[test]
+fn multiple_delete_ranges_with_inserts_between() {
+    let merk = InMemoryMerk::new();
+    let batch: Vec<_> = (0u8..30).map(|i| (vec![i], Op::Put(vec![i]))).collect();
+    merk.apply_sorted_batch_ops(&batch).unwrap();
+
+    // Delete [3,8), insert at 8, delete [10,20), insert at 15 and 20
+    let mixed = vec![
+        (vec![3], Op::DeleteRange(vec![8])),
+        (vec![8], Op::Put(vec![88])),
+        (vec![10], Op::DeleteRange(vec![20])),
+        (vec![15], Op::Put(vec![150])),
+        (vec![20], Op::Put(vec![200])),
+    ];
+    merk.apply_sorted_batch_ops(&mixed).unwrap();
+
+    // First range: [3,8) deleted
+    assert_eq!(merk.get(&[2]), Some(vec![2]));
+    assert_eq!(merk.get(&[3]), None);
+    assert_eq!(merk.get(&[7]), None);
+    assert_eq!(merk.get(&[8]), Some(vec![88])); // re-inserted with new value
+
+    // Second range: [10,20) deleted
+    assert_eq!(merk.get(&[9]), Some(vec![9]));
+    assert_eq!(merk.get(&[10]), None);
+    assert_eq!(merk.get(&[14]), None);
+    assert_eq!(merk.get(&[15]), Some(vec![150])); // re-inserted
+    assert_eq!(merk.get(&[16]), None);
+    assert_eq!(merk.get(&[19]), None);
+    assert_eq!(merk.get(&[20]), Some(vec![200])); // updated (end boundary, was not deleted)
+    assert_eq!(merk.get(&[21]), Some(vec![21]));
+}
+
+#[test]
+fn delete_range_entire_tree_then_rebuild() {
+    let merk = InMemoryMerk::new();
+    let batch: Vec<_> = (1u8..=5)
+        .map(|i| (vec![i], Op::Put(vec![i * 10])))
+        .collect();
+    merk.apply_sorted_batch_ops(&batch).unwrap();
+
+    // Delete everything [0, 255) then insert new keys
+    let mixed = vec![
+        (vec![0], Op::DeleteRange(vec![255])),
+        (vec![10], Op::Put(b"ten".to_vec())),
+        (vec![20], Op::Put(b"twenty".to_vec())),
+        (vec![30], Op::Put(b"thirty".to_vec())),
+    ];
+    merk.apply_sorted_batch_ops(&mixed).unwrap();
+
+    // Old keys gone
+    for i in 1u8..=5 {
+        assert_eq!(merk.get(&[i]), None);
+    }
+    // New keys present
+    assert_eq!(merk.get(&[10]), Some(b"ten".to_vec()));
+    assert_eq!(merk.get(&[20]), Some(b"twenty".to_vec()));
+    assert_eq!(merk.get(&[30]), Some(b"thirty".to_vec()));
+}
+
+#[test]
+fn delete_range_then_update_adjacent_keys() {
+    // Verify keys immediately adjacent to the range are updateable
+    let merk = InMemoryMerk::new();
+    let batch: Vec<_> = (0u8..20)
+        .map(|i| (vec![i], Op::Put(vec![i * 10])))
+        .collect();
+    merk.apply_sorted_batch_ops(&batch).unwrap();
+
+    // Delete [5, 15), update key 4 (just before range) and key 15 (end boundary)
+    let mixed = vec![
+        (vec![4], Op::Put(vec![44])),
+        (vec![5], Op::DeleteRange(vec![15])),
+        (vec![15], Op::Put(vec![155])),
+    ];
+    merk.apply_sorted_batch_ops(&mixed).unwrap();
+
+    assert_eq!(merk.get(&[4]), Some(vec![44])); // updated
+    assert_eq!(merk.get(&[5]), None); // deleted
+    assert_eq!(merk.get(&[14]), None); // deleted
+    assert_eq!(merk.get(&[15]), Some(vec![155])); // updated
+}
+
+#[test]
+fn delete_range_on_empty_range_no_keys_in_range() {
+    // Delete range where no keys exist (gap between existing keys)
+    let merk = InMemoryMerk::new();
+    let batch = vec![(vec![1], Op::Put(vec![10])), (vec![10], Op::Put(vec![100]))];
+    merk.apply_sorted_batch_ops(&batch).unwrap();
+
+    // Delete [3, 8) - no keys exist in this range
+    merk.delete_range([3], [8]).unwrap();
+
+    // Tree should be unchanged
+    assert_eq!(merk.get(&[1]), Some(vec![10]));
+    assert_eq!(merk.get(&[10]), Some(vec![100]));
+    // Hash might differ due to split/join restructuring, so don't assert hash equality
+}
+
+#[test]
+fn delete_range_covering_single_key() {
+    let merk = InMemoryMerk::new();
+    let batch: Vec<_> = (0u8..10)
+        .map(|i| (vec![i], Op::Put(vec![i * 10])))
+        .collect();
+    merk.apply_sorted_batch_ops(&batch).unwrap();
+
+    // Delete [5, 6) - only key 5
+    merk.delete_range([5], [6]).unwrap();
+    assert_eq!(merk.get(&[4]), Some(vec![40]));
+    assert_eq!(merk.get(&[5]), None);
+    assert_eq!(merk.get(&[6]), Some(vec![60]));
+}
+
+#[test]
+fn delete_range_then_delete_adjacent_in_same_batch() {
+    // Delete a range, then also point-delete the key just outside
+    let merk = InMemoryMerk::new();
+    let batch: Vec<_> = (0u8..20)
+        .map(|i| (vec![i], Op::Put(vec![i * 10])))
+        .collect();
+    merk.apply_sorted_batch_ops(&batch).unwrap();
+
+    let mixed = vec![
+        (vec![5], Op::DeleteRange(vec![10])),
+        (vec![10], Op::Delete), // point-delete the key at end boundary
+    ];
+    merk.apply_sorted_batch_ops(&mixed).unwrap();
+
+    assert_eq!(merk.get(&[4]), Some(vec![40]));
+    for i in 5u8..=10 {
+        assert_eq!(merk.get(&[i]), None, "key {} should be gone", i);
+    }
+    assert_eq!(merk.get(&[11]), Some(vec![110]));
+}
+
+#[test]
+fn adjacent_delete_ranges_in_one_batch() {
+    // Two ranges that share a boundary: [5,10) and [10,15)
+    let merk = InMemoryMerk::new();
+    let batch: Vec<_> = (0u8..20)
+        .map(|i| (vec![i], Op::Put(vec![i * 10])))
+        .collect();
+    merk.apply_sorted_batch_ops(&batch).unwrap();
+
+    let mixed = vec![
+        (vec![5], Op::DeleteRange(vec![10])),
+        (vec![10], Op::DeleteRange(vec![15])),
+    ];
+    merk.apply_sorted_batch_ops(&mixed).unwrap();
+
+    assert_eq!(merk.get(&[4]), Some(vec![40]));
+    for i in 5u8..15 {
+        assert_eq!(merk.get(&[i]), None, "key {} should be deleted", i);
+    }
+    assert_eq!(merk.get(&[15]), Some(vec![150]));
+}
+
+#[test]
+fn overlapping_delete_ranges_in_one_batch() {
+    let merk = InMemoryMerk::new();
+    let batch: Vec<_> = (0u8..30).map(|i| (vec![i], Op::Put(vec![i]))).collect();
+    merk.apply_sorted_batch_ops(&batch).unwrap();
+
+    let mixed = vec![
+        (vec![5], Op::DeleteRange(vec![15])),
+        (vec![10], Op::DeleteRange(vec![20])),
+    ];
+    merk.apply_sorted_batch_ops(&mixed).unwrap();
+
+    assert_eq!(merk.get(&[4]), Some(vec![4]));
+    for i in 5u8..20 {
+        assert_eq!(merk.get(&[i]), None, "key {} should be deleted", i);
+    }
+    assert_eq!(merk.get(&[20]), Some(vec![20]));
+}
+
+#[test]
+fn contained_delete_ranges_in_one_batch() {
+    let merk = InMemoryMerk::new();
+    let batch: Vec<_> = (0u8..30).map(|i| (vec![i], Op::Put(vec![i]))).collect();
+    merk.apply_sorted_batch_ops(&batch).unwrap();
+
+    let mixed = vec![
+        (vec![5], Op::DeleteRange(vec![20])),
+        (vec![10], Op::DeleteRange(vec![15])),
+    ];
+    merk.apply_sorted_batch_ops(&mixed).unwrap();
+
+    assert_eq!(merk.get(&[4]), Some(vec![4]));
+    for i in 5u8..20 {
+        assert_eq!(merk.get(&[i]), None, "key {} should be deleted", i);
+    }
+    assert_eq!(merk.get(&[20]), Some(vec![20]));
+}
+
+#[test]
+fn delete_range_with_inserts_filling_entire_range() {
+    // Delete a range then re-insert ALL keys within it with new values
+    let merk = InMemoryMerk::new();
+    let batch: Vec<_> = (0u8..10).map(|i| (vec![i], Op::Put(vec![i]))).collect();
+    merk.apply_sorted_batch_ops(&batch).unwrap();
+
+    let mut mixed: Vec<(Vec<u8>, Op)> = vec![(vec![3], Op::DeleteRange(vec![7]))];
+    for i in 3u8..7 {
+        mixed.push((vec![i], Op::Put(vec![i + 100])));
+    }
+    merk.apply_sorted_batch_ops(&mixed).unwrap();
+
+    // All keys should exist with new values
+    for i in 3u8..7 {
+        assert_eq!(merk.get(&[i]), Some(vec![i + 100]));
+    }
+    // Surrounding keys untouched
+    assert_eq!(merk.get(&[2]), Some(vec![2]));
+    assert_eq!(merk.get(&[7]), Some(vec![7]));
+}
+
+#[test]
+fn delete_range_handles_empty_key_and_prefix_boundaries() {
+    let merk = InMemoryMerk::new();
+    let batch = vec![
+        (Vec::new(), Op::Put(b"empty".to_vec())),
+        (vec![0], Op::Put(b"zero".to_vec())),
+        (vec![0, 1], Op::Put(b"zero-one".to_vec())),
+        (vec![1], Op::Put(b"one".to_vec())),
+    ];
+    merk.apply_sorted_batch_ops(&batch).unwrap();
+
+    merk.delete_range(Vec::new(), vec![1]).unwrap();
+
+    assert_eq!(merk.get(&[]), None);
+    assert_eq!(merk.get(&[0]), None);
+    assert_eq!(merk.get(&[0, 1]), None);
+    assert_eq!(merk.get(&[1]), Some(b"one".to_vec()));
+}
+
+fn build_apply_writes_avl_fixture() -> InMemoryMerk {
+    let merk = InMemoryMerk::new();
+    for (key, value) in [
+        (b"keep".to_vec(), b"keep".to_vec()),
+        (b"gone".to_vec(), b"gone".to_vec()),
+        (b"pre:old".to_vec(), b"pre-old".to_vec()),
+        (b"del:a".to_vec(), b"del-a".to_vec()),
+        (vec![0xff, 0x00], b"ff0".to_vec()),
+        (vec![0xff, 0x10], b"ff1".to_vec()),
+    ] {
+        merk.put(key, value).unwrap();
+    }
+    merk
+}
+
+#[test]
+fn avl_apply_writes_ordered_matches_individual_writes() {
+    let ops = vec![
+        WriteOp::Put {
+            key: b"k".to_vec(),
+            value: b"a".to_vec(),
+        },
+        WriteOp::Put {
+            key: b"k".to_vec(),
+            value: b"b".to_vec(),
+        },
+        WriteOp::Delete {
+            key: b"gone".to_vec(),
+        },
+        WriteOp::DeleteRange {
+            start: b"del:".to_vec(),
+            end: b"del;".to_vec(),
+        },
+        WriteOp::Put {
+            key: b"del:z".to_vec(),
+            value: b"after-range".to_vec(),
+        },
+        WriteOp::DeletePrefix {
+            prefix: b"pre:".to_vec(),
+        },
+        WriteOp::Put {
+            key: b"pre:new".to_vec(),
+            value: b"after-prefix".to_vec(),
+        },
+        WriteOp::DeletePrefix { prefix: vec![0xff] },
+    ];
+
+    let batched = build_apply_writes_avl_fixture();
+    let individual = build_apply_writes_avl_fixture();
+
+    let before_empty = batched.root_hash();
+    batched.apply_write_ops(&[]).unwrap();
+    assert_eq!(batched.root_hash(), before_empty);
+
+    batched.apply_write_ops(&ops).unwrap();
+    for op in &ops {
+        individual
+            .apply_write_ops(std::slice::from_ref(op))
+            .unwrap();
+    }
+
+    assert_ne!(batched.root_hash(), before_empty);
+    assert_eq!(batched.root_hash(), individual.root_hash());
+    assert_eq!(batched.get(b"k"), Some(b"b".to_vec()));
+    assert_eq!(batched.get(b"gone"), None);
+    assert_eq!(batched.get(b"del:a"), None);
+    assert_eq!(batched.get(b"del:z"), Some(b"after-range".to_vec()));
+    assert_eq!(batched.get(b"pre:old"), None);
+    assert_eq!(batched.get(b"pre:new"), Some(b"after-prefix".to_vec()));
+    assert_eq!(batched.get(&[0xff, 0x00]), None);
+    assert_eq!(batched.get(&[0xff, 0x10]), None);
+    assert_eq!(batched.get(b"keep"), Some(b"keep".to_vec()));
+}
+
+#[test]
+fn avl_apply_writes_rolls_back_on_unsupported_move_prefix() {
+    let merk = InMemoryMerk::new();
+    merk.put(b"a".to_vec(), b"1".to_vec()).unwrap();
+    let before_hash = merk.root_hash();
+    let before_entries = merk.checkpoint().collect_range(&[], None).unwrap();
+
+    let err = merk
+        .apply_write_ops(&[
+            WriteOp::Put {
+                key: b"b".to_vec(),
+                value: b"2".to_vec(),
+            },
+            WriteOp::MovePrefix {
+                from: b"from:".to_vec(),
+                to: b"to:".to_vec(),
+            },
+            WriteOp::Put {
+                key: b"c".to_vec(),
+                value: b"3".to_vec(),
+            },
+        ])
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        crate::Error::Unsupported(UnsupportedFeature::MovePrefix)
+    ));
+    assert_eq!(merk.root_hash(), before_hash);
+    assert_eq!(
+        merk.checkpoint().collect_range(&[], None).unwrap(),
+        before_entries
+    );
+
+    merk.apply_write_ops(&[WriteOp::Put {
+        key: b"d".to_vec(),
+        value: b"4".to_vec(),
+    }])
+    .unwrap();
+    assert_eq!(merk.get(b"d"), Some(b"4".to_vec()));
 }

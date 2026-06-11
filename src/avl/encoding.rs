@@ -1,11 +1,11 @@
 use std::cmp::max;
 use std::io::{Read, Write};
 
-use crate::node::NodePtr;
+use crate::avl::node::NodePtr;
 
-use crate::child::Child;
+use crate::avl::child::Child;
+use crate::avl::node::{Node, NodeInner};
 use crate::hash::{Hash, HASH_LENGTH, NULL_HASH};
-use crate::node::{Node, NodeInner};
 use ed::{Decode, Encode};
 
 impl Encode for Node {
@@ -141,7 +141,7 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::child::Child;
+    use crate::avl::child::Child;
     use crate::error::Result;
 
     #[test]

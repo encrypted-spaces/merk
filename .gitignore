@@ -3,3 +3,4 @@ temp.db
 *.db
 .DS_Store
 Cargo.lock
+.dual-agent/

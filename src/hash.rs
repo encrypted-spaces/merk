@@ -56,7 +56,7 @@ fn finalize_to_hash<D: Digest>(hasher: D) -> Hash {
 // used with the same direct syscall — still faster than the Digest trait.
 
 #[cfg(target_os = "zkvm")]
-mod zkvm_sha {
+pub(crate) mod zkvm_sha {
     extern "C" {
         pub fn sys_sha_buffer(
             out_state: *mut [u32; 8],

@@ -2,8 +2,8 @@ use std::cmp::max;
 #[cfg(not(use_box))]
 use std::sync::Arc;
 
-use crate::child::Child;
-use crate::error::Result;
+use crate::avl::child::Child;
+use crate::error::{Error, Result};
 use crate::hash::{kv_hash, node_hash, Hash, Hasher, NULL_HASH};
 
 #[cfg(not(use_box))]
@@ -203,6 +203,11 @@ impl Node {
             self.child_hash(true),
             self.child_hash(false),
         )
+    }
+
+    #[inline]
+    pub fn root_hash(&self) -> Hash {
+        self.hash()
     }
 
     /// Returns the cached `node_hash`, if any.
@@ -481,6 +486,10 @@ impl Node {
         }
     }
 
+    pub fn get_result(&self, key: &[u8]) -> Result<GetResult> {
+        self.get_value(key)
+    }
+
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         match self.get_value(key) {
             Ok(GetResult::Found(v)) => Some(v),
@@ -497,8 +506,78 @@ impl Node {
     {
         crate::proofs::query::prove_resident(Some(self), query)
     }
+
+    pub fn collect_range(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if end.is_some_and(|end| start >= end) {
+            return Ok(Vec::new());
+        }
+
+        let mut out = Vec::new();
+        self.collect_range_inner(start, end, &mut out)?;
+        Ok(out)
+    }
+
+    pub fn collect_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let end = prefix_successor(prefix);
+        self.collect_range(prefix, end.as_deref())
+    }
+
+    fn collect_range_inner(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        out: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<()> {
+        if self.key() > start {
+            self.collect_range_child(true, start, end, out)?;
+        }
+
+        if self.key() >= start && end.is_none_or(|end| self.key() < end) {
+            out.push((self.key().to_vec(), self.value().to_vec()));
+        }
+
+        if end.is_none_or(|end| self.key() < end) {
+            self.collect_range_child(false, start, end, out)?;
+        }
+
+        Ok(())
+    }
+
+    fn collect_range_child(
+        &self,
+        left: bool,
+        start: &[u8],
+        end: Option<&[u8]>,
+        out: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<()> {
+        match self.child_ref(left) {
+            Some(Child::Resident(child)) => child.collect_range_inner(start, end, out),
+            Some(Child::Pruned(pruned)) => Err(Error::PrunedNode(format!(
+                "AVL snapshot range scan descended into pruned node {:?}",
+                pruned.key()
+            ))),
+            None => Ok(()),
+        }
+    }
 }
 
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    while let Some(&last) = end.last() {
+        if last < 0xff {
+            *end.last_mut().expect("last checked above") += 1;
+            return Some(end);
+        }
+        end.pop();
+    }
+    None
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GetResult {
     Found(Vec<u8>),
     Pruned,
@@ -516,7 +595,7 @@ pub fn side_to_str(left: bool) -> &'static str {
 #[cfg(test)]
 mod test {
     use super::Node;
-    use crate::child::Child;
+    use crate::avl::child::Child;
     use crate::error::Result;
     use crate::hash::NULL_HASH;
 

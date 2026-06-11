@@ -10,6 +10,7 @@ license = "Apache-2.0"
 
 [dependencies]
 thiserror= "1.0.58"
+serde = { version = "1.0", features = ["derive"] }
 # Use RISC0's accelerated SHA256 when compiled for guest.  To compile for RISC0 use this crate with default-features=false
 sha2 = { git = "https://github.com/risc0/RustCrypto-hashes", tag = "sha2-v0.10.8-risczero.0" }
 
@@ -32,7 +33,15 @@ features = ["small_rng"]
 [dev-dependencies.criterion]
 version = "0.5"
 
+[dev-dependencies.serde_json]
+version = "1.0"
+
 [[bench]]
 name = "ops"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "tracer"
 harness = false
 required-features = ["bench"]

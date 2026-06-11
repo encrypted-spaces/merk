@@ -4,8 +4,8 @@ use std::io::{Read, Write};
 
 use ed::{Decode, Encode, Result, Terminated};
 
+use crate::avl::node::Node;
 use crate::hash::Hash;
-use crate::node::Node;
 
 /// Metadata for a child node that has been pruned from memory.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -244,8 +244,8 @@ fn read_u8<R: Read>(mut input: R) -> Result<u8> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::avl::node::Node;
     use crate::hash::NULL_HASH;
-    use crate::node::Node;
 
     #[test]
     fn types() -> std::result::Result<(), crate::error::Error> {

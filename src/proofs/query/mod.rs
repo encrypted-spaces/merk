@@ -4,11 +4,11 @@ use {super::Op, std::collections::LinkedList};
 
 use super::proof_tree::execute;
 use super::{Decoder, Node};
-use crate::child::Child;
+use crate::avl::child::Child;
+use crate::avl::node::Node as TreeNode;
+use crate::avl::walker::RefWalker;
 use crate::error::{Error, Result};
 use crate::hash::Hash;
-use crate::node::Node as TreeNode;
-use crate::walker::RefWalker;
 use std::cmp::{max, min, Ordering};
 use std::collections::BTreeSet;
 use std::ops::RangeInclusive;
@@ -76,6 +76,10 @@ impl Query {
         }
 
         self.items.insert(item);
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &QueryItem> {
+        self.items.iter()
     }
 }
 
@@ -416,9 +420,9 @@ mod test {
     use super::super::encoding::encode_into;
     use super::super::*;
     use super::*;
-    use crate::node::Node as TreeNode;
+    use crate::avl::node::Node as TreeNode;
+    use crate::avl::walker::RefWalker;
     use crate::test_utils::make_tree_seq;
-    use crate::walker::RefWalker;
     use ed::Encode;
 
     fn make_3_node_tree() -> Result<TreeNode> {
